@@ -68,6 +68,10 @@ DEFAULTS = {
     "canvas_br": None,
     "picker": "wheel",       # "wheel" (color wheel + brightness slider) or "hex" (text box)
     "hex_box": None,
+    "ring_center": None,     # hue-ring picker: ring center, a point mid-band, square corners
+    "ring_point": None,
+    "square_tl": None,
+    "square_br": None,
     "wheel_center": None,
     "wheel_edge": None,      # any point on the wheel's outer rim
     "value_top": None,       # brightness slider, white end
@@ -1125,7 +1129,7 @@ def step_parts(cfg, st, prev):
     ui = max(cfg["frame_ms"], cfg.get("picker_ms", 30)) / 1000
     fixed = 0.0
     if prev is None or st[0] != prev[0]:  # color change
-        fixed += (10 * ui if cfg["picker"] == "wheel" else 0.15 + 55 * cfg["key_ms"] / 1000)
+        fixed += (10 * ui if cfg["picker"] in ("wheel", "ring") else 0.15 + 55 * cfg["key_ms"] / 1000)
         fixed += cfg["color_wait_ms"] / 1000
     if (prev is None or st[1] != prev[1]) and cfg.get("brush_min") and cfg.get("brush_max"):
         fixed += 5 * ui + 0.1  # brush size change
@@ -1138,7 +1142,7 @@ def step_components(cfg, st, prev):
     ui = max(cfg["frame_ms"], cfg.get("picker_ms", 30)) / 1000
     color = brush = 0.0
     if prev is None or st[0] != prev[0]:
-        color = (10 * ui if cfg["picker"] == "wheel" else 0.15 + 55 * cfg["key_ms"] / 1000) + cfg["color_wait_ms"] / 1000
+        color = (10 * ui if cfg["picker"] in ("wheel", "ring") else 0.15 + 55 * cfg["key_ms"] / 1000) + cfg["color_wait_ms"] / 1000
     if (prev is None or st[1] != prev[1]) and cfg.get("brush_min") and cfg.get("brush_max"):
         brush = 5 * ui + 0.1
     return (ticks + holds) * (cfg["frame_ms"] / 1000 + TICK_OVERHEAD), color, brush
@@ -1523,8 +1527,29 @@ class Drawer:
     def set_color(self, hexstr):
         if self.cfg["picker"] == "wheel":
             self.set_color_wheel(hexstr)
+        elif self.cfg["picker"] == "ring":
+            self.set_color_ring(hexstr)
         else:
             self.set_color_hex(hexstr)
+
+    def set_color_ring(self, hexstr):
+        """Hue ring around a color square: ring has red at the top with hue increasing
+        clockwise; square has full color on the left, white on the right, black at the bottom."""
+        r, g, b = (int(hexstr[i:i + 2], 16) / 255 for i in (0, 2, 4))
+        h, sat, v = colorsys.rgb_to_hsv(r, g, b)
+        if self.cfg.get("value_curve") and v > 0:
+            v = min(1.0, max(0.0, inverse_curve(self.cfg["value_curve"], v)))
+        if sat > 0.02:  # grays don't need a hue
+            (cx, cy), (ex, ey) = self.cfg["ring_center"], self.cfg["ring_point"]
+            rr = math.hypot(ex - cx, ey - cy)
+            ang = math.radians(90 - h * 360)  # clockwise from the top
+            self.press_at(cx + rr * math.cos(ang), cy - rr * math.sin(ang))
+        (x0, y0), (x1, y1) = self.cfg["square_tl"], self.cfg["square_br"]
+        inset = 0.04  # stay inside the square (its corners are rounded)
+        fx = inset + (1 - 2 * inset) * (1 - sat)
+        fy = inset + (1 - 2 * inset) * (1 - v)
+        self.press_at(x0 + (x1 - x0) * fx, y0 + (y1 - y0) * fy)
+        precise_sleep(self.cfg["color_wait_ms"] / 1000.0)
 
     def set_color_wheel(self, hexstr):
         r, g, b = (int(hexstr[i:i + 2], 16) / 255 for i in (0, 2, 4))
@@ -1549,7 +1574,7 @@ class Drawer:
 
     def activate(self):
         """First click on the game (Roblox may swallow it to focus the window)."""
-        pt = self.cfg["hex_box"] if self.cfg["picker"] == "hex" else self.cfg["wheel_center"]
+        pt = {"hex": self.cfg["hex_box"], "ring": self.cfg.get("square_tl")}.get(self.cfg["picker"], self.cfg["wheel_center"])
         self.click(*pt)
         time.sleep(0.3)
         self.t = time.perf_counter()
@@ -2735,6 +2760,10 @@ class App(QWidget):
            ("value_top", "Brightness slider top (white)", "wheel"),
            ("value_bottom", "Brightness slider bottom (black)", "wheel"),
            ("hex_box", "Hex color text box", "hex"),
+           ("ring_center", "Hue ring center", "ring"),
+           ("ring_point", "Hue ring: middle of the colored band", "ring"),
+           ("square_tl", "Color square top-left corner", "ring"),
+           ("square_br", "Color square bottom-right corner", "ring"),
            ("timer_tl", "Timer box top-left (optional)", "all"),
            ("timer_br", "Timer box bottom-right (optional)", "all"),
            ("brush_min", "Brush slider left end (optional)", "all"),
@@ -2841,7 +2870,8 @@ class App(QWidget):
         self.picker = QComboBox()
         self.picker.addItem("Color wheel + brightness slider", "wheel")
         self.picker.addItem("Hex text box", "hex")
-        self.picker.setCurrentIndex(0 if self.cfg["picker"] == "wheel" else 1)
+        self.picker.addItem("Hue ring + color square", "ring")
+        self.picker.setCurrentIndex({"wheel": 0, "hex": 1, "ring": 2}.get(self.cfg["picker"], 0))
         self.picker.currentIndexChanged.connect(self.update_picker_rows)
         cal_l.addRow("Color picker", self.picker)
         self.cal_labels, self.cal_rows = {}, []
@@ -3185,8 +3215,8 @@ class App(QWidget):
         try:
             self.read_settings()
             self.missing_calibration()
-            if self.cfg["picker"] != "wheel":
-                raise ValueError("Color check is for the color wheel picker")
+            if self.cfg["picker"] not in ("wheel", "ring"):
+                raise ValueError("Color check is for the color wheel / hue ring pickers")
         except Exception as e:
             self.error(str(e))
             return
