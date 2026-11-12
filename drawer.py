@@ -1913,7 +1913,7 @@ class Drawer:
 
         self.activate()
         self.set_color("000000")
-        sweep = (0, 4, 8, 13, 20, 30, 42, 56, 72, 100)
+        sweep = (0, 1, 2, 4, 8, 13, 20, 30, 42, 56, 72, 100)  # low end too: the smallest brush matters
         self.status("Brush sweep: drawing test dots...")
         curve, seen_any, last = [], False, None
         for p in sweep:
@@ -2639,6 +2639,93 @@ def choose_sizes(img, cfg, curve, budget, emit=lambda m: None, prefetched=None):
     return c, plan, e, sz
 
 
+# ---------- auto settings: pick what looks best within the time limit ----------
+
+def render_plan(plan, cfg, shape):
+    """Draw the plan offline (round brushes at their real sizes) onto a canvas of the target's
+    shape (HS px per cell) - what the game should end up showing."""
+    sizes = brush_sizes(cfg)
+    sp = cfg["spacing"]
+    out = np.full(shape, 255, np.uint8)
+    for hx, tag, strokes in plan:
+        col = tuple(int(hx[i:i + 2], 16) for i in (0, 2, 4))
+        r = sizes.get(tag, sp / 0.9) / sp * HS / 2
+        for pts in strokes:
+            P = np.array([[(x + 0.5) * HS * 16, (y + 0.5) * HS * 16] for x, y in pts], np.int32)
+            if len(P) > 1:
+                cv2.polylines(out, [P], False, col, max(1, int(round(2 * r))), cv2.LINE_8, 4)
+            for q in (P[[0, -1]] if len(P) > 1 else P):
+                cv2.circle(out, (int(q[0]), int(q[1])), max(1, int(r * 16)), col, -1, cv2.LINE_8, 4)
+    return out
+
+
+def source_on_canvas(img, cfg, shape):
+    """The original picture, placed and scaled on the canvas like the plan places it."""
+    im = ImageOps.exif_transpose(img).convert("RGBA")
+    bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+    bg.alpha_composite(im)
+    im = bg.convert("RGB")
+    gh, gw = shape[0] // HS, shape[1] // HS
+    sc = min(gw / im.width, gh / im.height)
+    w, h = max(1, min(gw, round(im.width * sc))), max(1, min(gh, round(im.height * sc)))
+    src = np.full(shape, 255, np.uint8)
+    ox, oy = (gw - w) // 2, (gh - h) // 2
+    src[oy * HS:(oy + h) * HS, ox * HS:(ox + w) * HS] = np.asarray(im.resize((w * HS, h * HS), Image.LANCZOS))
+    return src
+
+
+def _quality_job(img, cfg):
+    """(look error, predicted seconds) for one candidate: average color difference between
+    the rendered drawing and the original (lower = looks more like the picture)."""
+    plan, est = plan_for(img, cfg)
+    tl, br, sp = cfg["canvas_tl"], cfg["canvas_br"], cfg["spacing"]
+    shape = (int((br[1] - tl[1]) / sp) * HS, int((br[0] - tl[0]) / sp) * HS, 3)
+    a = cv2.resize(render_plan(plan, cfg, shape), (shape[1] // 2, shape[0] // 2), interpolation=cv2.INTER_AREA)
+    b = cv2.resize(source_on_canvas(img, cfg, shape), (shape[1] // 2, shape[0] // 2), interpolation=cv2.INTER_AREA)
+    la = _to_lab(a.reshape(-1, 3).astype(np.float64))
+    lb = _to_lab(b.reshape(-1, 3).astype(np.float64))
+    return float(np.sqrt(((la - lb) ** 2).sum(1)).mean()), est
+
+
+AUTO_SETTINGS = [  # setting, values to try (in this order, one setting at a time)
+    ("colors", [8, 12, 16, 20, 24, 32]),
+    ("smooth", [0.0, 0.5, 1.0, 1.5, 2.0]),
+    ("merge_de", [3.0, 5.0, 8.0, 12.0]),
+    ("denoise", [0, 3, 5]),
+    ("line_art", [True, False]),
+    ("edge_contrast", [8.0, 12.0, 15.0, 20.0, 30.0]),
+]
+
+
+def auto_settings(img, cfg, budget, emit=lambda m: None):
+    """Pick brush sizes (from the measured slider) and image settings that make the drawing
+    look most like the picture while fitting `budget` seconds. Each setting's values are
+    rendered and scored in parallel. Returns (best cfg, error, seconds, changes)."""
+    c = dict(cfg)
+    if c.get("brush_curve") and c.get("brush_min") and c.get("brush_max"):
+        emit("Auto settings: picking brush sizes...")
+        c, _, _, _ = choose_sizes(img, c, c["brush_curve"], budget, emit)
+    err, est = _quality_job(img, c)
+    emit(f"Auto settings: start - look error {err:.2f}, ~{est:.0f}s")
+    changes = []
+    tiny_on = plan_args(img, c)[8] > 0  # an edge pass is possible with these brushes
+    for key, values in AUTO_SETTINGS:
+        if key == "edge_contrast" and not tiny_on:
+            continue  # no edge pass with these brushes
+        tries = [(v, pool().submit(_quality_job, img, dict(c, **{key: v}))) for v in values if v != c.get(key)]
+        best = (err, est, c.get(key))
+        for v, f in tries:
+            e2, t2 = f.result()
+            if t2 <= budget and e2 < best[0] - 0.02:
+                best = (e2, t2, v)
+        if best[2] != c.get(key):
+            changes.append(f"{key} {c.get(key)} -> {best[2]}")
+            c[key] = best[2]
+            err, est = best[0], best[1]
+        emit(f"Auto settings: {key} = {c.get(key)} (look error {err:.2f}, ~{est:.0f}s)")
+    return c, err, est, changes
+
+
 _FIT_CACHE = {}
 
 
@@ -2817,6 +2904,7 @@ class Bridge(QObject):
     speed_done = Signal(dict, list)
     color_done = Signal(dict)
     timing = Signal(dict)
+    settings_done = Signal(dict)
     progress = Signal(str, float, str, str)
     auto_done = Signal(dict)
 
@@ -2883,6 +2971,7 @@ class App(QWidget):
         self.bridge.speed_done.connect(self.apply_auto_speed)
         self.bridge.color_done.connect(self.apply_color_check)
         self.bridge.timing.connect(self.learn_timing)
+        self.bridge.settings_done.connect(self.apply_auto_settings)
 
         self.setWindowTitle("Roblox Drawer")
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
@@ -2913,6 +3002,11 @@ class App(QWidget):
         fix = QPushButton("Correct now: screenshot the canvas and fix mistakes")
         fix.clicked.connect(self.correct_now)
         dl.addWidget(fix)
+        as_btn = QPushButton("Auto settings: pick the best-looking settings for this picture")
+        as_btn.setToolTip("Tries colors, smoothing, merging, line art and edge settings, renders each "
+                          "drawing offline and keeps what looks most like the picture within the time limit.")
+        as_btn.clicked.connect(self.auto_settings)
+        dl.addWidget(as_btn)
         cc_btn = QPushButton("Color check: test the picker's colors (fixes dark colors turning black)")
         cc_btn.clicked.connect(self.color_check)
         dl.addWidget(cc_btn)
@@ -3151,20 +3245,29 @@ class App(QWidget):
     def big_radius_cells(self):
         return self.cfg["big_brush_pt"] / 2 / self.cfg["spacing"] if self.big_brush_on() else 0.0
 
-    def can_repick(self):
-        """Brush sizes can be re-picked per picture once Auto brush has measured the slider."""
+    @staticmethod
+    def image_key(img):
+        import hashlib
+        return hashlib.md5(img.tobytes()).hexdigest()
+
+    def can_repick(self, img=None):
+        """Brush sizes can be re-picked per picture once Auto brush has measured the slider -
+        unless Auto settings already picked everything for this exact picture."""
+        if img is not None and self.cfg.get("auto_settings_for") == self.image_key(img):
+            return False
         curve = self.cfg.get("brush_curve")
         return bool(self.cfg.get("brush_min") and self.cfg.get("brush_max") and curve and len(curve) >= 2)
 
     def preview(self):
         note = ""
         try:
-            if self.can_repick():  # show what Start will draw: sizes re-picked for this picture
+            img0 = self.source_image()
+            if self.can_repick(img0):  # show what Start will draw: sizes re-picked for this picture
                 self.read_settings()
                 self.missing_calibration()
                 self.set_status_main("Picking brush sizes for this picture...")
                 QApplication.processEvents()
-                img = self.source_image()
+                img = img0
                 cfg, plan, est, desc = fit_to_time(img, dict(self.cfg), 0.93 * self.cfg["time_limit"])
                 note = f" | brushes for this picture: {desc}"
             else:
@@ -3241,6 +3344,47 @@ class App(QWidget):
         def job(d):
             self.bridge.auto_done.emit(d.auto_brush(pick_sizes))
         self.launch(job)
+
+    def auto_settings(self):
+        try:
+            self.read_settings()
+            self.missing_calibration()
+            img = self.source_image()
+            img.load()
+        except Exception as e:
+            self.error(str(e))
+            return
+        cfg = dict(self.cfg)
+        emit = self.bridge.status.emit
+
+        key = self.image_key(img)
+
+        def work():
+            try:
+                c, err, est, changes = auto_settings(img, cfg, 0.93 * cfg["time_limit"], emit)
+                c["auto_settings_for"] = key  # Start/Preview use these exact settings for this picture
+                self.bridge.settings_done.emit({"cfg": c, "err": err, "est": est, "changes": changes})
+            except Exception as e:
+                emit(f"Auto settings failed: {e}")
+        emit("Auto settings: working (this takes ~10-30s)...")
+        threading.Thread(target=work, daemon=True).start()
+
+    def apply_auto_settings(self, res):
+        c = res["cfg"]
+        for key in ("colors", "smooth", "merge_de", "denoise", "edge_contrast", "spacing", "brush_pct",
+                    "big_brush_pct", "tiny_brush_pct"):
+            if key in self.edits and key in c:
+                self.edits[key][0].setText(str(c[key]))
+        for key in ("brush_pt", "big_brush_pt", "tiny_brush_pt", "auto_settings_for"):
+            if key in c:
+                self.cfg[key] = c[key]
+        self.line_art.setChecked(bool(c.get("line_art", True)))
+        self.read_settings()
+        _FIT_CACHE.clear()
+        self.preview()
+        changed = "; ".join(res["changes"]) or "your settings were already the best found"
+        self.set_status_main(f"Auto settings: {changed} | ~{res['est']:.0f}s, look error {res['err']:.2f} | "
+                             + self.status_label.text())
 
     def learn_timing(self, info):
         """A run finished (or was stopped): learn from it. Per part (mouse steps, color changes,
@@ -3431,7 +3575,7 @@ class App(QWidget):
             except Exception as e:
                 self.error(str(e))
                 return
-            if self.can_repick():
+            if self.can_repick(img):
                 # pick brush sizes for this picture (fit the Auto brush time limit) from the saved
                 # slider table - no test dots - while the countdown runs
                 cfg, state = dict(self.cfg), {}
