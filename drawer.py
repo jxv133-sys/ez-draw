@@ -1411,6 +1411,31 @@ def select_all():
     time.sleep(KEY_DELAY)
 
 
+class DotPacker:
+    """Places square test slots left-to-right in rows inside the canvas (any shape/size)."""
+
+    def __init__(self, tl, br, margin=4, gap=6):
+        self.x0, self.y0 = tl[0] + margin, tl[1] + margin
+        self.x1, self.y1 = br[0] - margin, br[1] - margin
+        self.gap = gap
+        self.cx, self.ry, self.rh = self.x0, self.y0, 0.0
+
+    def max_side(self):
+        return min(self.x1 - self.x0, self.y1 - self.y0)
+
+    def place(self, side):
+        """Center of a free square of this side, or None when the canvas is full."""
+        side = min(side, self.max_side())
+        if self.cx + side > self.x1:  # next row
+            self.cx, self.ry, self.rh = self.x0, self.ry + self.rh + self.gap, 0.0
+        if self.ry + side > self.y1 or side <= 0:
+            return None
+        c = (self.cx + side / 2, self.ry + side / 2)
+        self.cx += side + self.gap
+        self.rh = max(self.rh, side)
+        return c
+
+
 STAGE_OF = {"huge": "fill", "big": "fill", "medium": "fill", "fine": "fill", "tiny": "edges", "line": "lines"}
 
 
@@ -1809,20 +1834,25 @@ class Drawer:
         self.set_color("000000")
         tl, br = self.cfg["canvas_tl"], self.cfg["canvas_br"]
         has_slider = bool(self.cfg["brush_min"] and self.cfg["brush_max"])
-        dots = [("brush_pt", self.cfg["brush_pct"], tl[0] + 60, tl[1] + 60, 55)]
+        packer = DotPacker(tl, br)
+        dots = [("brush_pt", self.cfg["brush_pct"], self.cfg.get("brush_pt") or 20)]
         if has_slider and self.cfg["big_brush_pct"] > 0:
-            bx = min(tl[0] + 220, (tl[0] + br[0]) / 2)
-            dots.append(("big_brush_pt", self.cfg["big_brush_pct"], bx, tl[1] + 100, 95))
+            dots.append(("big_brush_pt", self.cfg["big_brush_pct"], self.cfg.get("big_brush_pt") or 60))
         if has_slider and self.cfg["tiny_brush_pct"] > 0:
-            dots.append(("tiny_brush_pt", self.cfg["tiny_brush_pct"], tl[0] + 60, tl[1] + 180, 40))
+            dots.append(("tiny_brush_pt", self.cfg["tiny_brush_pct"], self.cfg.get("tiny_brush_pt") or 10))
         out = []
-        for key, pct, cx, cy, half in dots:
+        for key, pct, guess in dots:
+            side = min(max(16.0, guess * 1.5 + 10), packer.max_side())
+            pos = packer.place(side)
+            if pos is None:
+                break
             if has_slider:
                 self.set_brush(pct)
-            self.stroke([(cx, cy)])
-            self.move(br[0] - 5, br[1] - 5)  # keep the cursor off the dot
-            time.sleep(0.5)
-            out.append((key, measure_dot(cx, cy, half), (cx, cy)))
+            self.stroke([pos])
+            self.move(br[0] + 5, br[1] + 5)  # keep the cursor off the dot
+            time.sleep(0.4)
+            d = measure_dot(pos[0], pos[1], side / 2)
+            out.append((key, d if d is None or d < side * 0.92 else None, pos))
         return out
 
     def measure_batch(self, items, half):
@@ -1846,41 +1876,67 @@ class Drawer:
         img, scale = cap
         return [dot_diameter(img, scale, x0, y0, cx, cy, hf) for _, (cx, cy), hf in items]
 
+    def probe(self, packer, pct, guess):
+        """Draw one test dot at slider pct in a slot sized for `guess` (pt) and measure it.
+        Returns diameter, "big" (bigger than its slot), "full" (no room left) or None."""
+        side = max(16.0, guess * 1.5 + 10)
+        pos = packer.place(side)
+        if pos is None:
+            return "full"
+        side = min(side, packer.max_side())
+        self.check()
+        if self.cfg.get("brush_min") and self.cfg.get("brush_max"):
+            self.set_brush(pct)
+        self.stroke([pos])
+        br = self.cfg["canvas_br"]
+        self.move(br[0] + 5, br[1] + 5)  # keep the cursor off the dot
+        time.sleep(0.3)
+        d = measure_dot(pos[0], pos[1], side / 2)
+        if d is not None and d >= side * 0.92:
+            return "big"
+        return d
+
     def auto_brush(self, pick_sizes):
         """Trial and error: sweep the brush slider measuring dot sizes, let pick_sizes(curve)
-        choose target diameters, then home in on the slider position for each target.
+        choose target diameters, then home in on the slider position for each target. Test
+        dots are packed into whatever canvas space there is (works on small/squished canvases).
         Returns {"fine": (pct, d), "big": (pct, d) or None, "tiny": (pct, d) or None, "curve": [...]}."""
         tl, br = self.cfg["canvas_tl"], self.cfg["canvas_br"]
-        # small test dots in the top third of the canvas, big ones (up to ~200pt) below
-        cell, half, bcell, bhalf = 100, 48, 220, 105
-        split = tl[1] + (br[1] - tl[1]) / 3
-        slots = [(float(x) + cell / 2, float(y) + cell / 2)
-                 for y in np.arange(tl[1] + 5, split - cell, cell)
-                 for x in np.arange(tl[0] + 5, br[0] - cell, cell)]
-        bslots = [(float(x) + bcell / 2, float(y) + bcell / 2)
-                  for y in np.arange(split + 5, br[1] - bcell, bcell)
-                  for x in np.arange(tl[0] + 5, br[0] - bcell, bcell)]
-        if len(slots) < 14 or len(bslots) < 4:
-            raise RuntimeError("Canvas too small for brush tests")
-        slot, bslot = iter(slots), iter(bslots)
+        packer = DotPacker(tl, br)
+        prior = sorted(self.cfg.get("brush_curve") or [])
 
-        def place(size_guess):
-            nb = next(bslot, None) if size_guess > 2 * half * 0.8 else None
-            return (nb, bhalf) if nb else (next(slot), half)
+        def guess_for(p, last):
+            if prior and len(prior) >= 2:
+                xs, ys = zip(*prior)
+                return float(np.interp(p, xs, ys))
+            return 20.0 if last is None else last[1] * 1.7 + 6
 
         self.activate()
         self.set_color("000000")
-
         sweep = (0, 4, 8, 13, 20, 30, 42, 56, 72, 100)
         self.status("Brush sweep: drawing test dots...")
-        items = [(p, *place(0 if p <= 30 else 999)) for p in sweep]
-        ds = self.measure_batch(items, half)
-        curve = [(p, d) for (p, _, hf), d in zip(items, ds) if d is not None and d < 2 * hf * 0.95]
-        if not any(ds):
-            raise RuntimeError("Can't see the test dots. Grant Screen Recording to the app running "
-                               "this script (System Settings > Privacy & Security), restart it, retry.")
+        curve, seen_any, last = [], False, None
+        for p in sweep:
+            g = guess_for(p, last)
+            if g > packer.max_side() * 0.9:  # dots this big don't fit this canvas: stop here
+                break
+            d = self.probe(packer, p, g)
+            if d == "big":  # guessed too small: one more try with a bigger slot
+                d = self.probe(packer, p, g * 2.5 + 10)
+            if d == "full" or d == "big":
+                break
+            if d is None:
+                if not seen_any and p >= 8:
+                    raise RuntimeError("Can't see the test dots. Grant Screen Recording to the app running "
+                                       "this script (System Settings > Privacy & Security), restart it, retry.")
+                continue
+            seen_any = True
+            curve.append((p, d))
+            last = (p, d)
+            self.status(f"Brush sweep: slider {p}% -> {d:.1f}pt")
         if len(curve) < 2:
-            raise RuntimeError("Brush size didn't change across the slider; check the brush slider calibration.")
+            raise RuntimeError("Not enough room or no size change across the slider: check the canvas and "
+                               "brush slider calibration (or clear the canvas and retry).")
 
         targets = {k: t for k, t in pick_sizes(sorted(curve)).items() if t}
         best = {}
@@ -1888,12 +1944,14 @@ class Drawer:
         for attempt in range(4):
             if not pending:
                 break
-            keys = list(pending)
-            items = [(self._pct_for(pending[k], curve), *place(pending[k])) for k in keys]
-            self.status("Tuning brushes: " + ", ".join(f"{k} {pending[k]:.1f}pt @ {p:.1f}%"
-                                                          for k, (p, _, _) in zip(keys, items)))
-            for k, (pct, _, _), d in zip(keys, items, self.measure_batch(items, half)):
-                if d is None:
+            for k in list(pending):
+                pct = self._pct_for(pending[k], curve)
+                self.status(f"Tuning {k} brush to {pending[k]:.1f}pt: slider {pct:.1f}%")
+                d = self.probe(packer, pct, pending[k])
+                if d == "full":
+                    pending.clear()
+                    break
+                if not isinstance(d, float):
                     continue
                 curve.append((pct, d))
                 t = targets[k]
@@ -1901,6 +1959,15 @@ class Drawer:
                     best[k] = (round(pct, 1), d)
                 if abs(d - t) <= 0.08 * t:
                     pending.pop(k)
+        lo, hi = min(d for _, d in curve), max(d for _, d in curve)
+        for k, t in targets.items():  # ran out of room while tuning: use what the curve predicts
+            if k in best:
+                continue
+            if lo <= t <= hi:
+                best[k] = (round(self._pct_for(t, curve), 1), round(t, 1))
+            else:
+                p, d = min(curve, key=lambda pd: abs(pd[1] - t))
+                best[k] = (round(p, 1), d)
         if "fine" not in best:
             raise RuntimeError("Couldn't measure the fine brush")
         return {"fine": best["fine"], "big": best.get("big"), "tiny": best.get("tiny"), "curve": sorted(curve)}
@@ -2047,20 +2114,21 @@ class Drawer:
 
     # ---- Auto speed: find the fastest timing the game still draws correctly ----
 
-    def _pattern(self, ox, oy, b):
+    def _pattern(self, ox, oy, b, length=150):
         """Test strokes for a slot at (ox, oy) with brush diameter b (pt): a serpentine with
         sharp corners (missed corner = diagonal streak across a gap), one long row drawn as
         a single move (no interpolation = gaps), and short dashes (start/end registration)."""
         gap = 2.6 * b
-        x0, x1 = ox + b, ox + b + 150
+        x0, x1 = ox + b, ox + b + length
         ys = [oy + b + i * gap for i in range(4)]
         zig = []
         for i, y in enumerate(ys):
             zig += [(x0, y), (x1, y)] if i % 2 == 0 else [(x1, y), (x0, y)]
         y4 = ys[-1] + gap
         y5 = y4 + gap
-        dashes = [[(x0 + k * 30, y5), (x0 + k * 30 + 12, y5)] for k in range(6)]
-        return [zig, [(x0, y4), (x0 + 190, y4)]] + dashes
+        n = max(2, min(6, int(length // 30)))
+        dashes = [[(x0 + k * 30, y5), (x0 + k * 30 + 12, y5)] for k in range(n)]
+        return [zig, [(x0, y4), (x0 + length * 1.27, y4)]] + dashes
 
     def _check_pattern(self, strokes, ox, oy, w, h, b):
         """Screenshot the slot and compare with the expected ink. Returns (ok, coverage, stray px)."""
@@ -2113,11 +2181,12 @@ class Drawer:
         base = dict(self.cfg)
         b = float(base.get("brush_pt") or base["spacing"] / 0.9)
         tl, br = base["canvas_tl"], base["canvas_br"]
-        w, h = 200 + 2 * b, 16 * b
+        length = max(40.0, min(150.0, (br[0] - tl[0] - 20 - 2 * b) / 1.35))  # fit narrow canvases
+        w, h = length * 1.33 + 2 * b, 16 * b
         slots = [(float(x), float(y)) for y in np.arange(tl[1] + 5, br[1] - h, h + 8)
                  for x in np.arange(tl[0] + 5, br[0] - w, w + 8)]
-        if len(slots) < 6:
-            raise RuntimeError("Canvas too small for speed tests")
+        if len(slots) < 3:
+            raise RuntimeError("Canvas too small for speed tests (needs room for 3 test patterns)")
         slot = iter(slots)
         log = []
         cur = {k: base[k] for k in ("frame_ms", "corner_frames", "segment", "color_wait_ms")}
@@ -2135,7 +2204,7 @@ class Drawer:
                 ok = res
                 msg = "colors ok" if res else "color came out wrong"
             else:
-                strokes = self._pattern(*pos, b)
+                strokes = self._pattern(*pos, b, length)
                 for pts in strokes:
                     self.stroke(pts)
                 self.move(br[0] - 3, br[1] - 3)
