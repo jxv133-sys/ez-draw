@@ -41,8 +41,8 @@ def precise_sleep(dt):
     if dt <= 0:
         return
     end = time.perf_counter() + dt
-    if dt > 0.006:
-        time.sleep(dt - 0.004)
+    if dt > 0.0025:
+        time.sleep(dt - 0.0015)
     while time.perf_counter() < end:
         pass
 
@@ -1148,6 +1148,13 @@ def step_components(cfg, st, prev):
     return (ticks + holds) * (cfg["frame_ms"] / 1000 + TICK_OVERHEAD), color, brush
 
 
+def step_value(st, cfg):
+    """How much a step adds to the picture: the area it paints (stroke length x brush width)."""
+    d = brush_sizes(cfg).get(st[1], cfg["spacing"] / 0.9) / cfg["spacing"]
+    length = sum(math.hypot(x1 - x0, y1 - y0) for pts in st[2] for (x0, y0), (x1, y1) in zip(pts, pts[1:]))
+    return (length + len(st[2])) * d
+
+
 def step_seconds(cfg, st, prev, calibrated=True):
     """Predicted seconds for one step. Calibrated: each part scaled by what real runs measured
     (learned per part: mouse steps, color changes, brush changes)."""
@@ -1171,7 +1178,7 @@ def fit_timing(rows, old=None):
     coef = np.ones(3)
     sol, *_ = np.linalg.lstsq(A[:, use], y, rcond=None)
     coef[use] = sol
-    coef = np.clip(coef, [0.6, 0.3, 0.3], [2.5, 4.0, 4.0])
+    coef = np.clip(coef, [0.6, 0.3, 0.3], [10.0, 10.0, 10.0])
     prev = old or {"mouse": 1.0, "color": 1.0, "brush": 1.0}
     keys = ["mouse", "color", "brush"]
     return {k: round(0.5 * prev.get(k, 1.0) + 0.5 * (coef[i] if use[i] else prev.get(k, 1.0)), 3)
@@ -1444,7 +1451,23 @@ class Drawer:
         self.cfg = cfg
         self.stop = stop_event
         self.status = status
-        self.progress = progress or (lambda stage, frac, text="", hx="": None)
+        raw_progress = progress or (lambda stage, frac, text="", hx="": None)
+        raw_status = status
+        last = {"p": 0.0, "s": 0.0}
+
+        def progress_throttled(stage, frac, text="", hx=""):
+            now = time.perf_counter()  # at most ~7 updates/s (window repaints compete with drawing)
+            if frac < 0 or frac >= 1.0 or now - last["p"] > 0.15:
+                last["p"] = now
+                raw_progress(stage, frac, text, hx)
+
+        def status_throttled(msg):
+            now = time.perf_counter()
+            if now - last["s"] > 0.15 or not msg.startswith("Step "):
+                last["s"] = now
+                raw_status(msg)
+        self.progress = progress_throttled
+        self.status = status_throttled
         self.stage_span = (0.0, 1.0)  # correction passes share one bar
         self.last = None
         self.frame = cfg["frame_ms"] / 1000.0
@@ -1719,8 +1742,49 @@ class Drawer:
         seq = list(plan) if isinstance(plan, list) else None  # a list can be re-planned mid-drawing
         it = None if seq is not None else iter(plan)
         plan = seq if seq is not None else plan
-        ci, upgraded = 0, False
+        ci, upgraded, simplified, pace = 0, False, False, []
         parts = []
+        last_check = [0.0]
+        base = {"t": None, "p": 0.0}  # pace is measured from here (reset after switching plans)
+
+        def late_check(pred_now):
+            """Running late with work already on the canvas: keep it, and drop the remaining
+            steps that add the least for their time (small / thin details first). Called every
+            ~2s, also during long steps; the pace of the last ~8s counts most."""
+            nonlocal parts, note
+            t0 = base["t"] if base["t"] is not None else start
+            elapsed = time.time() - t0
+            pred_now = pred_now - base["p"]
+            pace.append((elapsed, pred_now))
+            if elapsed - last_check[0] < 2 or elapsed < 6 or pred_now < 1.5:
+                return
+            if getattr(self, "_fallback", None) and not simplified and pred_now < 0.25 * (sum(costs) - base["p"]):
+                return  # little drawn yet: a simpler whole picture (next step) beats trimming
+            last_check[0] = elapsed
+            old = next(((e, p) for e, p in pace if elapsed - e <= 8), pace[0])
+            recent = (elapsed - old[0]) / max(0.1, pred_now - old[1]) if pred_now - old[1] > 0.3 else 0
+            speed = max(1.0, elapsed / pred_now, recent)
+            left = self.deadline - time.time() - 1.5
+            future = list(range(ci, len(seq)))  # steps after the current one
+            cur_left = max(0.0, sum(costs[:ci]) - base["p"] - pred_now)  # rest of the current step
+            need = (cur_left + sum(costs[i] for i in future)) * speed
+            if need <= left or not future:
+                return
+            value = {i: step_value(seq[i], self.cfg) / max(1e-3, costs[i]) for i in future}
+            drop = set()
+            for i in sorted(value, key=value.get):
+                if need <= left:
+                    break
+                drop.add(i)
+                need -= costs[i] * speed
+            keep = [i for i in range(len(seq)) if i not in drop]
+            seq[:] = [seq[i] for i in keep]
+            costs[:] = [costs[i] for i in keep]
+            del cache[ci:]
+            parts = []
+            note = f" | late: skipped {len(drop)} small details to finish"
+            self.status(f"Running {speed:.1f}x slower than planned: skipping {len(drop)} "
+                        "low-value detail steps to finish in time")
         while True:
             if seq is not None:
                 if ci >= len(seq):
@@ -1732,6 +1796,38 @@ class Drawer:
                     break
                 hexstr, size, strokes = nxt
             ci += 1
+            if seq is not None and costs and getattr(self, "_fallback", None) and not simplified:
+                # early check on the real pace: if this plan can't finish in time, switch to a
+                # simpler version of the whole picture (prepared in the background) that can.
+                # Only while little is drawn - later on, trimming the rest (below) wastes nothing.
+                elapsed = time.time() - start
+                pred_done = sum(costs[:ci - 1])
+                if pred_done > 0.25 * sum(costs):
+                    simplified = True  # too late for a full redraw
+                elif elapsed > 6 and pred_done > 1.5:
+                    simplified = True
+                    speed = elapsed / max(0.1, pred_done)
+                    left = self.deadline - time.time() - 1.5
+                    if sum(costs[ci - 1:]) * speed > left * 1.1:
+                        res = self._fallback(left, speed)
+                        if res:
+                            self.cfg, new, desc = res
+                            seq[ci - 1:] = new
+                            costs[ci - 1:] = self.step_costs(new)
+                            del cache[ci - 1:]
+                            parts = []
+                            pct = brush_pcts(self.cfg)
+                            s = self.cfg["spacing"]
+                            cur_size = None
+                            hexstr, size, strokes = seq[ci - 1]
+                            note = f" | simplified to finish in time ({desc})"
+                            base["t"], base["p"] = time.time(), sum(costs[:ci - 1])  # fresh pace for the new plan
+                            pace.clear()
+                            last_check[0] = 0.0
+                            self.status(f"Drawing {speed:.1f}x slower than planned: switching to a simpler "
+                                        f"version ({desc}) to finish in time")
+            if seq is not None and costs:
+                late_check(sum(costs[:ci - 1]))
             if seq is not None and costs and self._upgrade and not upgraded and not skip_tiny and size == "tiny":
                 # fills are done: if we're ahead of the clock, swap in a more detailed edge pass
                 upgraded = True
@@ -1802,9 +1898,13 @@ class Drawer:
                 self.set_brush(pct[size])
                 cur_size = size
             per_stroke = step_s / max(1, len(strokes))
+            step_pred0 = sum(costs[:ci - 1]) if costs else 0.0
+            step_cost_now = costs[ci - 1] if costs and ci - 1 < len(costs) else 0.0
             for si, pts in enumerate(strokes, 1):
                 self.stroke([(cx0 + (gx + 0.5) * s, cy0 + (gy + 0.5) * s) for gx, gy in pts])
                 done += 1
+                if costs and seq is not None:
+                    late_check(step_pred0 + step_cost_now * si / len(strokes))
                 done_s[stage] = done_s.get(stage, 0.0) + per_stroke
                 if si % 3 == 0 or si == len(strokes):
                     self._report(stage, done_s[stage], totals, f"#{hexstr} {label} - stroke {si}/{len(strokes)}", hexstr)
@@ -2823,6 +2923,9 @@ class ProgressPanel(QWidget):
 
     def _paint(self, key, state):
         lbl, bar, sw, info = self.rows[key]
+        if self.state.get(key) == state and getattr(bar, "_styled", None) == state:
+            return  # restyling is expensive; skip when unchanged
+        bar._styled = state
         self.state[key] = state
         bar.setStyleSheet(f"QProgressBar {{ border: 1px solid #bbb; border-radius: 3px; background: #f2f2f2; }}"
                           f"QProgressBar::chunk {{ background: {self.STYLE[state]}; border-radius: 2px; }}")
@@ -2878,7 +2981,8 @@ class ProgressPanel(QWidget):
         bar.setValue(int(frac * 1000))
         info.setText(text)
         self._paint(key, "cur")
-        if hx:
+        if hx and getattr(sw, "_hx", None) != hx:
+            sw._hx = hx
             sw.setStyleSheet(f"background: #{hx}; border: 1px solid #555; border-radius: 2px;")
 
     def finish(self, reason):
@@ -2957,7 +3061,7 @@ class App(QWidget):
                 pass
         # a factor learned from runs slowed by the old thread-priority bug isn't real
         tf = float(self.cfg.get("time_factor") or 1.0)
-        if not 0.8 <= tf <= 2.0:
+        if not 0.8 <= tf <= 10.0:
             self.cfg["time_factor"] = 1.0
         self.image_path = None
         self.stop_event = threading.Event()
@@ -3400,7 +3504,7 @@ class App(QWidget):
                 if 0.7 <= rate <= 1.3:
                     self.cfg["game_rate"] = round(0.5 * float(self.cfg.get("game_rate") or 1.0) + 0.5 * rate, 3)
                     msgs.append(f"game clock runs at {rate:.2f}x real time")
-        if 0.5 <= ratio <= 2.5:
+        if 0.4 <= ratio <= 10:
             model = fit_timing(info.get("rows") or [], self.cfg.get("timing_model"))
             if model:
                 self.cfg["timing_model"] = model
@@ -3413,12 +3517,12 @@ class App(QWidget):
 
     def _learn_factor(self, ratio):
         old = float(self.cfg.get("time_factor") or 1.0)
-        if not 0.5 <= ratio <= 2.5:  # wildly off = something was broken (e.g. a stalled run): don't learn it
+        if not 0.4 <= ratio <= 10:  # absurd = something was broken (e.g. a stalled run): don't learn it
             self.set_status_main(self.status_label.text() + f" | this run took {ratio:.1f}x the prediction - "
                                  "too far off to learn from (see drawer_log.txt)")
             return
         # ratio is against the raw model; keep a running average, clamped to sane values
-        new = min(2.0, max(0.8, 0.5 * old + 0.5 * ratio))
+        new = min(10.0, max(0.8, 0.5 * old + 0.5 * ratio))
         self.cfg["time_factor"] = round(new, 3)
         self.save()
         self.set_status_main(self.status_label.text() + f" | this run took {ratio:.2f}x the raw prediction; "
@@ -3649,11 +3753,51 @@ class App(QWidget):
             th = threading.Thread(target=lambda: box.update(t=target_for(img, d.cfg)), daemon=True)
             th.start()
         upgrade = self.edge_upgrader(img, d.cfg, plan, reserve=6.0 if passes else 1.0) if deadline else None
+        if deadline and isinstance(plan, list):
+            d._fallback = self.simpler_plans(img, d.cfg)
         self.last_drawn = (img, dict(d.cfg))
         d.run(plan, deadline=deadline, upgrade=upgrade)
         if passes:
             th.join()
             d.correct(box.get("t"), passes, deadline)
+
+    @staticmethod
+    def simpler_plans(img, cfg):
+        """Plan simpler versions of the picture in the background (bigger brushes, fewer colors,
+        no edges/line art). Returns fallback(left_s, speed) -> (cfg, plan, description) picking
+        the most detailed one that finishes in time at the measured pace."""
+        base = dict(cfg, line_art=False, tiny_brush_pct=0)
+        curve = cfg.get("brush_curve")
+        variants = []
+        cols = int(cfg["colors"])
+        if curve and len(curve) >= 2 and cfg.get("brush_min") and cfg.get("brush_max"):
+            cv = sorted(curve)
+            d_min, d_max = min(d for _, d in cv), max(d for _, d in cv)
+            fine = cfg.get("brush_pt") or cfg["spacing"] / 0.9
+            for mult, ncol, desc in ((1.7, max(6, cols - 4), "bigger brushes"),
+                                     (2.8, max(5, int(cols * 0.6)), "much bigger brushes, fewer colors"),
+                                     (4.5, 5, "simplest")):
+                f = min(d_max, max(d_min, fine * mult))
+                c = cfg_with_sizes(dict(base, colors=ncol), cv, *sizes_for(round(f, 1), d_min, d_max))
+                c["tiny_brush_pct"], c["tiny_brush_pt"] = 0, None
+                variants.append((desc, c))
+        else:
+            variants = [("fewer colors", dict(base, colors=max(6, cols - 4))),
+                        ("half the colors", dict(base, colors=max(4, cols // 2), smooth=float(cfg["smooth"]) + 1))]
+        futs = [(desc, c, pool().submit(_plan_job, img, c)) for desc, c in variants]
+
+        def fallback(left, speed):
+            pick = None
+            for desc, c, f in futs:  # most detailed first
+                try:
+                    plan, est = f.result(timeout=4)
+                except Exception:
+                    continue
+                pick = (c, plan, desc)
+                if est * speed <= left * 0.95:
+                    return pick
+            return pick  # nothing fits: the simplest one gets furthest
+        return fallback
 
     @staticmethod
     def edge_upgrader(img, cfg, plan, reserve):
