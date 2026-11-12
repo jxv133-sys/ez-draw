@@ -1,0 +1,6 @@
+pyobjc-framework-Quartz
+pyobjc-framework-Vision
+Pillow
+PySide6
+numpy
+opencv-python
