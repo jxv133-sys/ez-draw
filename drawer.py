@@ -1181,7 +1181,7 @@ def fit_timing(rows, old=None):
     coef = np.clip(coef, [0.6, 0.3, 0.3], [10.0, 10.0, 10.0])
     prev = old or {"mouse": 1.0, "color": 1.0, "brush": 1.0}
     keys = ["mouse", "color", "brush"]
-    return {k: round(0.5 * prev.get(k, 1.0) + 0.5 * (coef[i] if use[i] else prev.get(k, 1.0)), 3)
+    return {k: round(0.3 * prev.get(k, 1.0) + 0.7 * (coef[i] if use[i] else prev.get(k, 1.0)), 3)
             for i, k in enumerate(keys)}
 
 
@@ -1268,10 +1268,21 @@ def dot_diameter(img, scale, x0, y0, cx, cy, half):
     crop = img[max(0, py - hp):py + hp, max(0, px - hp):px + hp]
     if crop.size == 0:
         return None
-    dark = crop.mean(2) < 70
+    lum = crop.mean(2)
     c_y, c_x = min(hp, py), min(hp, px)  # dot center inside the crop
-    if not dark[max(0, c_y - 2):c_y + 3, max(0, c_x - 2):c_x + 3].any():
+    # compare with the canvas around it (small dots are anti-aliased: gray, not black)
+    border = np.concatenate([lum[0], lum[-1], lum[:, 0], lum[:, -1]])
+    bg = float(np.median(border))
+    core = float(lum[max(0, c_y - 3):c_y + 4, max(0, c_x - 3):c_x + 4].min())
+    if bg - core < 40:
+        return None  # nothing clearly darker than the canvas here
+    dark = lum < (bg + core) / 2  # half-way edge: measures the dot's real width
+    if not dark[max(0, c_y - 3):c_y + 4, max(0, c_x - 3):c_x + 4].any():
         return None
+    if not dark[c_y, c_x]:  # re-center on the darkest nearby pixel
+        win = lum[max(0, c_y - 3):c_y + 4, max(0, c_x - 3):c_x + 4]
+        dy, dx = np.unravel_index(np.argmin(win), win.shape)
+        c_y, c_x = max(0, c_y - 3) + dy, max(0, c_x - 3) + dx
 
     def extent(line, mid):
         if not line[mid]:
@@ -1286,7 +1297,7 @@ def dot_diameter(img, scale, x0, y0, cx, cy, half):
     row = dark[c_y] | dark[max(0, c_y - 1)]
     col = dark[:, c_x] | dark[:, max(0, c_x - 1)]
     d_px = max(extent(row, c_x), extent(col, c_y))
-    return round(d_px / scale, 1) if d_px >= 2 else None
+    return round(d_px / scale, 1) if d_px >= 1 else None
 
 
 def ocr_text(path):
@@ -2013,7 +2024,7 @@ class Drawer:
 
         self.activate()
         self.set_color("000000")
-        sweep = (0, 1, 2, 4, 8, 13, 20, 30, 42, 56, 72, 100)  # low end too: the smallest brush matters
+        sweep = (0, 1, 2, 3, 4, 6, 8, 13, 20, 30, 42, 56, 72, 100)  # low end too: the smallest brush matters
         self.status("Brush sweep: drawing test dots...")
         curve, seen_any, last = [], False, None
         for p in sweep:
@@ -3522,7 +3533,7 @@ class App(QWidget):
                                  "too far off to learn from (see drawer_log.txt)")
             return
         # ratio is against the raw model; keep a running average, clamped to sane values
-        new = min(10.0, max(0.8, 0.5 * old + 0.5 * ratio))
+        new = min(10.0, max(0.8, 0.3 * old + 0.7 * ratio))
         self.cfg["time_factor"] = round(new, 3)
         self.save()
         self.set_status_main(self.status_label.text() + f" | this run took {ratio:.2f}x the raw prediction; "
