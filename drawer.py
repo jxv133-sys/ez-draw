@@ -788,7 +788,7 @@ def _big_pass(M, T, rb, sx, open_sides=(False, False, False, False)):
 def build_plan(img, grid_w, grid_h, ncolors, skip_white, min_blob=3, big_r=0.0, denoise=3, tiny_r=0.0,
                edge_contrast=15.0, merge_de=8.0, min_color_frac=0.002, smooth=0, sink=None,
                target_only=False, edges_only=False, line_fill=True, line_art_r=0.0, line_contrast=35.0,
-               bucket=False):
+               bucket=False, predrawn=None):
     """img: PIL Image. Grid cell = fine brush spacing; fill rows are cells, fill columns are
     SUB sub-cells per cell. big_r / tiny_r = big / tiny brush radius in cells (0 = off).
     Returns (preview_image, steps); step = (hex, "big"|"fine"|"tiny", strokes),
@@ -942,6 +942,33 @@ def build_plan(img, grid_w, grid_h, ncolors, skip_white, min_blob=3, big_r=0.0, 
     tiers = [(t, r) for t, r in sorted(tiers, key=lambda tr: -tr[1]) if r >= 1.2]
     open_sides = (ox == 0, ox + w >= grid_w, oy == 0, oy + h >= grid_h)  # picture touches canvas edge
 
+    # background already drawn (while this plan was being made): (hex, radius cells or 0 for a
+    # bucket fill, strokes in cells). Cells it surely covered are left out of the background fill.
+    pre_cov, pre_bucket = None, False
+    if predrawn and order:
+        bg_lab = _to_lab(np.array([pal[3 * order[0]:3 * order[0] + 3]], np.float64))[0]
+        cov = np.zeros((h * HS, w * HS), np.uint8)
+        for hx_, rc, strokes in predrawn:
+            lab_ = _to_lab(np.array([[int(hx_[i:i + 2], 16) for i in (0, 2, 4)]], np.float64))[0]
+            if np.sqrt(((lab_ - bg_lab) ** 2).sum()) > 10:
+                continue  # a different color: doesn't count as background
+            if rc <= 0:
+                pre_bucket = True
+                cov[:] = 1
+                continue
+            rad = rc * HS
+            for pts in strokes:
+                P = np.round(np.array([((x - ox + 0.5) * HS, (y - oy + 0.5) * HS) for x, y in pts]) * 16).astype(np.int32)
+                if len(P) > 1:
+                    cv2.polylines(cov, [P], False, 1, max(1, int(2 * rad)), cv2.LINE_8, 4)
+                for q in P:
+                    cv2.circle(cov, (int(q[0]), int(q[1])), int(rad * 16), 1, -1, cv2.LINE_8, 4)
+        if not pre_bucket:  # keep half a row of margin inside what the strokes covered
+            k = HS | 1
+            cov = cv2.erode(cov, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
+                            borderType=cv2.BORDER_CONSTANT, borderValue=1)
+        pre_cov = cov.astype(bool).reshape(h, HS, W, px).all(axis=(1, 3))
+
     plan = []
 
     def add(step):
@@ -952,7 +979,8 @@ def build_plan(img, grid_w, grid_h, ncolors, skip_white, min_blob=3, big_r=0.0, 
     for r, c in enumerate(order):
         hx = "{:02x}{:02x}{:02x}".format(*pal[3 * c:3 * c + 3])
         if c == bucket_c:  # one bucket click at the canvas center fills it all
-            add((hx, "bucket", [[(grid_w / 2 - 0.5, grid_h / 2 - 0.5)]]))
+            if not pre_bucket:
+                add((hx, "bucket", [[(grid_w / 2 - 0.5, grid_h / 2 - 0.5)]]))
             continue
         edge_for(c)
         M = RANK >= r
@@ -965,6 +993,8 @@ def build_plan(img, grid_w, grid_h, ncolors, skip_white, min_blob=3, big_r=0.0, 
             m = HS // 5
             M &= ~hard[:, m:HS - m].any(axis=(1, 3))
         T = (D == c) & M
+        if r == 0 and pre_cov is not None:
+            T &= ~pre_cov
         if c in edge_cells:
             T &= ~edge_cells[c]
         lines = []
@@ -1897,6 +1927,37 @@ class Drawer:
             self.status(f"Running {speed:.1f}x slower than planned: skipping {len(drop)} "
                         "low-value detail steps to finish in time")
         while True:
+            if seq is not None and ci >= len(seq) and getattr(self, "_pending", None) is not None:
+                # the background is done: switch to the full plan (wait if it's still planning)
+                pend, self._pending = self._pending, None
+                w0 = time.time()
+                if not pend.ready.is_set():
+                    self.status("Background done; waiting for the plan to finish...")
+                    self.progress("plan", -1, "finishing the plan...", "")
+                while not pend.ready.wait(0.1):
+                    self.check()
+                start += time.time() - w0  # waiting isn't slow drawing
+                if pend.result is not None:
+                    self.cfg, new, desc = pend.result
+                    new = [st for st in new if not (st[1] == "bucket" and bucketed)]
+                    self.progress("plan", 1.0, desc[:60], "")
+                    seq.extend(new)
+                    if costs is not None:
+                        costs.extend(self.step_costs(new))
+                    pct = brush_pcts(self.cfg)
+                    s = self.cfg["spacing"]
+                    has_slider = bool(self.cfg["brush_min"] and self.cfg["brush_max"]) or has_arrows(self.cfg)
+                    cur_size = None
+                    del cache[ci:]
+                    parts = []
+                    base["t"], base["p"] = time.time(), sum(costs[:ci]) if costs else 0.0
+                    pace.clear()
+                    last_check[0] = 0.0
+                    self.status(f"Drawing the rest: {desc}")
+                    if getattr(self, "_on_swap", None):
+                        self._on_swap(self.cfg, new)
+                    total = sum(len(st) for _, _, st in seq)
+                continue
             if seq is not None:
                 if ci >= len(seq):
                     break
@@ -2715,7 +2776,10 @@ def plan_kw(cfg):
     return {"line_fill": bool(cfg.get("line_fill", True)),
             "line_art_r": line_brush_pt(cfg) / 2 / cfg["spacing"] if cfg.get("line_art", True) else 0.0,
             "line_contrast": float(cfg.get("line_contrast", 35)),
-            "bucket": has_bucket(cfg)}
+            "bucket": has_bucket(cfg),
+            "predrawn": [(hx, d / 2 / cfg["spacing"], [[(x / cfg["spacing"] - 0.5, y / cfg["spacing"] - 0.5)
+                                                       for x, y in p] for p in strokes])
+                         for hx, d, strokes in cfg.get("_predrawn") or []] or None}
 
 
 def has_bucket(cfg):
@@ -2726,6 +2790,13 @@ def plan_for(img, cfg):
     """Build the plan for cfg's canvas/brushes. Returns (plan, estimated seconds)."""
     _, plan = build_plan(*plan_args(img, cfg), **plan_kw(cfg))
     return plan, estimate_seconds(plan, cfg, cfg["spacing"])
+
+
+class Pending:
+    """A plan being made in the background: .ready is set once .result = (cfg, plan, desc)."""
+
+    def __init__(self):
+        self.ready, self.result = threading.Event(), None
 
 
 class PlanStream:
@@ -2924,11 +2995,15 @@ def render_plan(plan, cfg, shape):
     sizes = brush_sizes(cfg)
     sp = cfg["spacing"]
     out = np.full(shape, 255, np.uint8)
-    for hx, tag, strokes in plan:
+    pre = [(hx, "bucket" if d <= 0 else ("pre", d), [[(x / sp - 0.5, y / sp - 0.5) for x, y in p] for p in st])
+           for hx, d, st in cfg.get("_predrawn") or []]  # background drawn before this plan
+    for hx, tag, strokes in pre + list(plan):
         col = tuple(int(hx[i:i + 2], 16) for i in (0, 2, 4))
         if tag == "bucket":
             out[:] = col
             continue
+        if isinstance(tag, tuple):
+            sizes[tag] = tag[1]
         r = sizes.get(tag, sp / 0.9) / sp * HS / 2
         for pts in strokes:
             P = np.array([[(x + 0.5) * HS * 16, (y + 0.5) * HS * 16] for x, y in pts], np.int32)
@@ -3071,20 +3146,10 @@ def _fit_to_time(img, cfg, budget, emit=lambda m: None):
     and colors. Returns (cfg, plan, est, description)."""
     curve = cfg.get("brush_curve")
     if cfg.get("brush_min") and cfg.get("brush_max") and curve and len(curve) >= 2:
-        # speculatively plan the detail upgrades for the finest brush alongside (usually it fits)
-        cv = sorted(curve)
-        d_min, d_max = curve_range(cfg, cv)
-        c_f = cfg_with_sizes(cfg, cv, *sizes_for(round(max(3.0, d_min), 1), d_min, d_max))
-        spec = [(desc, dict(c_f, **chg), pool().submit(_plan_job, img, dict(c_f, **chg)))
-                for desc, chg in detail_levels(c_f)]
         c, plan, est, (fine, big, tiny) = choose_sizes(img, cfg, curve, budget, emit)
         desc = f"fine {fine:.1f}pt" + (f", big {big:.0f}pt" if big else "") + (f", tiny {tiny:.1f}pt" if tiny else "")
-        same = c.get("brush_pt") == c_f.get("brush_pt")
-        if not same:
-            for *_, f in spec:
-                f.cancel()
         if est <= budget:
-            c, plan, est, more = upgrade_detail(img, c, plan, est, budget, emit, spec if same else None)
+            c, plan, est, more = upgrade_detail(img, c, plan, est, budget, emit)
             return c, plan, est, desc + (f", {more}" if more else "")
         cfg = c  # even the biggest brush is too slow: also trim edges/colors below
         prefix = desc + ", "
@@ -3937,29 +4002,74 @@ class App(QWidget):
             # planning runs during the 5s countdown; drawing starts when both are done (+~1.5s clicks)
             return total / rate - max(5.0, time.time() - clicked) - 1.5
 
-        def prepare(note):
-            budget = left_for_drawing()
+        curve = cfg.get("brush_curve")
+        early = bool(curve and len(curve) >= 2 and ((cfg.get("brush_min") and cfg.get("brush_max")) or has_arrows(cfg)))
+
+        def plan_full(note, budget, base):
             say = lambda m: note.update(msg=m)
             if tune:
-                c, plan, est, desc = auto_tune(img, cfg, 0.93 * budget, say)
+                c, plan, est, desc = auto_tune(img, base, 0.93 * budget, say)
             elif exact:
-                plan, est = plan_for(img, cfg)
-                c, desc = cfg, "your settings"
+                plan, est = plan_for(img, base)
+                c, desc = base, "your settings"
                 if est > budget:  # too much for the time: simplify instead of overrunning
-                    c, plan, est, desc = fit_to_time(img, cfg, 0.93 * budget, say)
+                    c, plan, est, desc = fit_to_time(img, base, 0.93 * budget, say)
             else:
                 for _ in range(2):
-                    c, plan, est, desc = fit_to_time(img, cfg, 0.93 * budget, say)
+                    c, plan, est, desc = fit_to_time(img, base, 0.93 * budget, say)
                     if est <= left_for_drawing() or budget <= 5:
                         break
                     budget = left_for_drawing() - (est - left_for_drawing()) - 2  # planning ran long
-            remaining = left_for_drawing()
-            state["plan"] = plan
-            note["msg"] = (f"{desc}, ~{est:.0f}s of {remaining:.0f}s"
-                           + ("" if est <= remaining else " (won't fully fit: will simplify while drawing)"))
-            return c
+            return c, plan, est, desc
 
-        self.launch(lambda d: self.draw_and_correct(d, img, state["plan"], clicked + total / rate), prepare,
+        def prepare(note):
+            budget = left_for_drawing()
+            if not early:
+                c, plan, est, desc = plan_full(note, budget, cfg)
+                remaining = left_for_drawing()
+                state["plan"] = plan
+                note["msg"] = (f"{desc}, ~{est:.0f}s of {remaining:.0f}s"
+                               + ("" if est <= remaining else " (won't fully fit: will simplify while drawing)"))
+                return c
+            # start drawing early: a quick coarse plan gives the background (largest color, big
+            # brushes or the bucket), drawn while the full plan is made without it
+            note["msg"] = "quick plan for the background..."
+            d_min, d_max = curve_range(cfg, sorted(curve))
+            qc = cfg_with_sizes(cfg, sorted(curve), *sizes_for(max(d_min, min(30.0, d_max)), d_min, d_max))
+            qplan, _ = plan_for(img, qc)
+            bg = []
+            for st in qplan:
+                if st[0] != qplan[0][0] or st[1] not in ("bucket", "huge", "big", "medium", "fine"):
+                    break
+                bg.append(st)
+            sizes, sp = brush_sizes(qc), qc["spacing"]
+            pre = [(hx, 0.0 if tag == "bucket" else sizes[tag],
+                    [[((x + 0.5) * sp, (y + 0.5) * sp) for x, y in p] for p in strokes]) for hx, tag, strokes in bg]
+            bg_s = estimate_seconds(bg, qc) if bg else 0.0
+            pend = Pending()
+            full_cfg = dict(cfg, _predrawn=pre) if pre else cfg
+
+            def work():
+                boost_thread()
+                try:
+                    # the rest can only start once planned: leave out the planning time too
+                    wait = max(0.0, (35.0 if tune else 12.0) - bg_s)
+                    c, plan, est, desc = plan_full(note, budget - bg_s - wait, full_cfg)
+                    pend.result = (c, plan, f"{desc}, ~{est:.0f}s")
+                except Exception as e:
+                    note["msg"] = f"planning failed ({e}): using the quick plan"
+                    pend.result = (qc, qplan[len(bg):], "quick plan")
+                finally:
+                    pend.ready.set()
+
+            threading.Thread(target=work, daemon=True).start()
+            state["plan"], state["pending"] = bg, pend
+            note["msg"] = (f"drawing the background ({len(bg)} step{'s' * (len(bg) != 1)}, ~{bg_s:.0f}s) "
+                           "while planning the rest" if bg else "planning while starting")
+            return qc
+
+        self.launch(lambda d: self.draw_and_correct(d, img, state["plan"], clicked + total / rate,
+                                                    state.get("pending")), prepare,
                     stages=self.draw_stages(self.cfg))
 
     @staticmethod
@@ -3969,23 +4079,32 @@ class App(QWidget):
             stages.append("correct")
         return stages
 
-    def draw_and_correct(self, d, img, plan, deadline=None):
+    def draw_and_correct(self, d, img, plan, deadline=None, pending=None):
         """Draw, then screenshot-check and repaint mistakes while time allows. With a deadline,
         spare time is spent on detail: a richer edge pass if the fills finish early, then
-        correction passes until the time is up."""
+        correction passes until the time is up. pending: the full plan still being made
+        (plan is then just the background, drawn meanwhile)."""
         passes = int(d.cfg.get("correct_passes", 0))
         if deadline and passes:
             passes = 50  # keep correcting until time's up / nothing left to fix
-        box = {}
-        if passes:  # build the comparison target alongside the drawing
-            th = threading.Thread(target=lambda: box.update(t=target_for(img, d.cfg)), daemon=True)
-            th.start()
-        upgrade = self.edge_upgrader(img, d.cfg, plan, reserve=6.0 if passes else 1.0) if deadline else None
-        if deadline and isinstance(plan, list):
-            d._fallback = self.simpler_plans(img, d.cfg)
+        box, th = {}, None
+
+        def setup(cfg, full):
+            nonlocal th
+            if passes:  # build the comparison target alongside the drawing
+                th = threading.Thread(target=lambda: box.update(t=target_for(img, cfg)), daemon=True)
+                th.start()
+            if deadline:
+                d._upgrade = self.edge_upgrader(img, cfg, full, reserve=6.0 if passes else 1.0)
+                d._fallback = self.simpler_plans(img, cfg)
+
+        if pending is not None:
+            d._pending, d._on_swap, d._fallback = pending, setup, None
+        else:
+            setup(d.cfg, plan)
+        d.run(plan, deadline=deadline, upgrade=getattr(d, "_upgrade", None))
         self.last_drawn = (img, dict(d.cfg))
-        d.run(plan, deadline=deadline, upgrade=upgrade)
-        if passes:
+        if passes and th is not None:
             th.join()
             d.correct(box.get("t"), passes, deadline)
 
