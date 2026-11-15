@@ -81,6 +81,9 @@ DEFAULTS = {
     "brush_min": None,       # brush size slider, left end
     "brush_max": None,       # brush size slider, right end
     "brush_pct": 10,         # fine brush slider position (0-100)
+    "bucket_tool": None,     # optional paint bucket tool button (fills the background in one click)
+    "brush_tool": None,      # brush/pen tool button (to switch back after the bucket)
+    "use_bucket": True,
     "brush_dec": None,       # optional brush size arrows (exact +-1 steps, for small brushes)
     "brush_inc": None,
     "arrow_curve": None,     # measured [(clicks above minimum, diameter pt)]
@@ -784,7 +787,8 @@ def _big_pass(M, T, rb, sx, open_sides=(False, False, False, False)):
 
 def build_plan(img, grid_w, grid_h, ncolors, skip_white, min_blob=3, big_r=0.0, denoise=3, tiny_r=0.0,
                edge_contrast=15.0, merge_de=8.0, min_color_frac=0.002, smooth=0, sink=None,
-               target_only=False, edges_only=False, line_fill=True, line_art_r=0.0, line_contrast=35.0):
+               target_only=False, edges_only=False, line_fill=True, line_art_r=0.0, line_contrast=35.0,
+               bucket=False):
     """img: PIL Image. Grid cell = fine brush spacing; fill rows are cells, fill columns are
     SUB sub-cells per cell. big_r / tiny_r = big / tiny brush radius in cells (0 = off).
     Returns (preview_image, steps); step = (hex, "big"|"fine"|"tiny", strokes),
@@ -830,6 +834,14 @@ def build_plan(img, grid_w, grid_h, ncolors, skip_white, min_blob=3, big_r=0.0, 
     L = _majority(L, int(smooth * HS) | 1 if smooth > 0 else 0)
     if min_blob > 1:
         L = _despeckle_cv(L, min_blob * HS * HS // 2)
+    bucket_c = None
+    if bucket:  # paint bucket: the largest color is filled over the whole canvas in one click,
+        # so white is no longer free (it gets painted like any color). Not worth it if the
+        # largest color is white already (the canvas is white).
+        big_c = int(np.argmax(np.bincount(L.reshape(-1), minlength=256)[:npal]))
+        if not (skip_white and white[big_c]) and min(pal[3 * big_c:3 * big_c + 3]) < 245:
+            bucket_c = big_c
+            white = np.zeros_like(white)
     ox, oy = (grid_w - w) // 2, (grid_h - h) // 2
     if target_only:  # just the color target (for screenshot correction)
         rgb = np.array(pal, dtype=np.uint8).reshape(-1, 3)[L]
@@ -939,6 +951,9 @@ def build_plan(img, grid_w, grid_h, ncolors, skip_white, min_blob=3, big_r=0.0, 
 
     for r, c in enumerate(order):
         hx = "{:02x}{:02x}{:02x}".format(*pal[3 * c:3 * c + 3])
+        if c == bucket_c:  # one bucket click at the canvas center fills it all
+            add((hx, "bucket", [[(grid_w / 2 - 0.5, grid_h / 2 - 0.5)]]))
+            continue
         edge_for(c)
         M = RANK >= r
         if c in edges and r > 0:
@@ -1139,6 +1154,9 @@ def simulate(plan, grid_w, grid_h, spacing, sizes, size=420):
     cv = np.full((H, W, 3), 255, np.uint8)
     for hx, tag, strokes in plan:
         col = tuple(int(hx[i:i + 2], 16) for i in (0, 2, 4))
+        if tag == "bucket":
+            cv[:] = col
+            continue
         r = max(0.5, sizes.get(tag, spacing) * k / 2)
         for pts in strokes:
             P = np.array([[(x + 0.5) * spacing * k * 16, (y + 0.5) * spacing * k * 16] for x, y in pts], np.int32)
@@ -1158,6 +1176,10 @@ def step_parts(cfg, st, prev):
     """(mouse ticks, corner-hold ticks, fixed seconds) for one plan step: mouse ticks scale with
     mouse speed, corner holds always last their normal time, color/brush switches are fixed
     (they click the game's picker and brush slider at a safe, slower pace)."""
+    if st[1] == "bucket":  # color + 3 clicks (bucket tool, canvas, brush tool) + fill render
+        ui = max(cfg["frame_ms"], cfg.get("picker_ms", 30)) / 1000
+        fixed = 10 * ui if cfg["picker"] in ("wheel", "ring") else 0.15 + 55 * cfg["key_ms"] / 1000
+        return 0, 0, fixed + cfg["color_wait_ms"] / 1000 + 9 * ui + 0.3
     holds = (cfg["corner_frames"] - 1) * sum(len(held_corners(p)) for p in st[2])
     ticks = count_events([st], cfg["spacing"], cfg["segment"], cfg["corner_frames"]) - holds
     ui = max(cfg["frame_ms"], cfg.get("picker_ms", 30)) / 1000
@@ -1172,6 +1194,8 @@ def step_parts(cfg, st, prev):
 
 def step_components(cfg, st, prev):
     """Raw predicted seconds of one step split into (mouse steps, color change, brush change)."""
+    if st[1] == "bucket":
+        return step_parts(cfg, st, prev)[2], 0.0, 0.0
     ticks, holds, _ = step_parts(cfg, st, prev)
     ui = max(cfg["frame_ms"], cfg.get("picker_ms", 30)) / 1000
     color = brush = 0.0
@@ -1184,6 +1208,8 @@ def step_components(cfg, st, prev):
 
 def step_value(st, cfg):
     """How much a step adds to the picture: the area it paints (stroke length x brush width)."""
+    if st[1] == "bucket":
+        return float("inf")  # the whole background
     d = brush_sizes(cfg).get(st[1], cfg["spacing"] / 0.9) / cfg["spacing"]
     length = sum(math.hypot(x1 - x0, y1 - y0) for pts in st[2] for (x0, y0), (x1, y1) in zip(pts, pts[1:]))
     return (length + len(st[2])) * d
@@ -1488,7 +1514,7 @@ class DotPacker:
         return c
 
 
-STAGE_OF = {"huge": "fill", "big": "fill", "medium": "fill", "fine": "fill", "tiny": "edges", "line": "lines"}
+STAGE_OF = {"bucket": "fill", "huge": "fill", "big": "fill", "medium": "fill", "fine": "fill", "tiny": "edges", "line": "lines"}
 
 
 class Drawer:
@@ -1596,6 +1622,14 @@ class Drawer:
         finally:
             _post(Quartz.kCGEventLeftMouseUp, x, y)
             self.tick()
+
+    def bucket_fill(self, x, y):
+        """Paint bucket at (x, y) with the current color, then back to the brush."""
+        self.click(*self.cfg["bucket_tool"])
+        self.click(x, y)
+        time.sleep(0.25)  # let the game flood the canvas
+        self.click(*self.cfg["brush_tool"])
+        self.t = time.perf_counter()
 
     def ui_wait(self):
         """Pause between events on the game's UI (color wheel, sliders). Kept at a safe
@@ -1819,6 +1853,7 @@ class Drawer:
         it = None if seq is not None else iter(plan)
         plan = seq if seq is not None else plan
         ci, upgraded, simplified, pace = 0, False, False, []
+        bucketed = False
         parts = []
         last_check = [0.0]
         base = {"t": None, "p": 0.0}  # pace is measured from here (reset after switching plans)
@@ -1967,6 +2002,14 @@ class Drawer:
             step_t0 = time.perf_counter()
             step_comp = step_components(self.cfg, (hexstr, size, strokes), getattr(self, "_prev_step", None))
             step_pred = sum(step_comp)
+            if size == "bucket":
+                if done == 0 and not bucketed:  # only on a blank canvas (a re-plan mid-drawing
+                    self.set_color(hexstr)      # would flood over what's drawn)
+                    cur_color = hexstr
+                    self.bucket_fill(cx0 + (strokes[0][0][0] + 0.5) * s, cy0 + (strokes[0][0][1] + 0.5) * s)
+                bucketed = True
+                done_s[stage] = done_s.get(stage, 0.0) + step_s
+                continue
             if hexstr != cur_color:
                 self.set_color(hexstr)
                 cur_color = hexstr
@@ -2671,7 +2714,12 @@ def plan_kw(cfg):
     """Keyword options for build_plan from cfg."""
     return {"line_fill": bool(cfg.get("line_fill", True)),
             "line_art_r": line_brush_pt(cfg) / 2 / cfg["spacing"] if cfg.get("line_art", True) else 0.0,
-            "line_contrast": float(cfg.get("line_contrast", 35))}
+            "line_contrast": float(cfg.get("line_contrast", 35)),
+            "bucket": has_bucket(cfg)}
+
+
+def has_bucket(cfg):
+    return bool(cfg.get("use_bucket", True) and cfg.get("bucket_tool") and cfg.get("brush_tool"))
 
 
 def plan_for(img, cfg):
@@ -2878,6 +2926,9 @@ def render_plan(plan, cfg, shape):
     out = np.full(shape, 255, np.uint8)
     for hx, tag, strokes in plan:
         col = tuple(int(hx[i:i + 2], 16) for i in (0, 2, 4))
+        if tag == "bucket":
+            out[:] = col
+            continue
         r = sizes.get(tag, sp / 0.9) / sp * HS / 2
         for pts in strokes:
             P = np.array([[(x + 0.5) * HS * 16, (y + 0.5) * HS * 16] for x, y in pts], np.int32)
@@ -2909,8 +2960,17 @@ def _quality_job(img, cfg):
     plan, est = plan_for(img, cfg)
     tl, br, sp = cfg["canvas_tl"], cfg["canvas_br"], cfg["spacing"]
     shape = (int((br[1] - tl[1]) / sp) * HS, int((br[0] - tl[0]) / sp) * HS, 3)
-    a = cv2.resize(render_plan(plan, cfg, shape), (shape[1] // 2, shape[0] // 2), interpolation=cv2.INTER_AREA)
-    b = cv2.resize(source_on_canvas(img, cfg, shape), (shape[1] // 2, shape[0] // 2), interpolation=cv2.INTER_AREA)
+    # compare inside the picture only (the bucket also fills the empty margins beside it)
+    gh, gw = shape[0] // HS, shape[1] // HS
+    iw, ih = ImageOps.exif_transpose(img).size
+    sc = min(gw / iw, gh / ih)
+    w, h = max(1, min(gw, round(iw * sc))), max(1, min(gh, round(ih * sc)))
+    ox, oy = (gw - w) // 2, (gh - h) // 2
+    sl = (slice(oy * HS, (oy + h) * HS), slice(ox * HS, (ox + w) * HS))
+    a = render_plan(plan, cfg, shape)[sl]
+    b = source_on_canvas(img, cfg, shape)[sl]
+    a = cv2.resize(a, (a.shape[1] // 2, a.shape[0] // 2), interpolation=cv2.INTER_AREA)
+    b = cv2.resize(b, (b.shape[1] // 2, b.shape[0] // 2), interpolation=cv2.INTER_AREA)
     la = _to_lab(a.reshape(-1, 3).astype(np.float64))
     lb = _to_lab(b.reshape(-1, 3).astype(np.float64))
     return float(np.sqrt(((la - lb) ** 2).sum(1)).mean()), est
@@ -3190,6 +3250,8 @@ class App(QWidget):
            ("timer_br", "Timer box bottom-right (optional)", "all"),
            ("brush_min", "Brush slider left end (optional)", "all"),
            ("brush_max", "Brush slider right end (optional)", "all"),
+           ("bucket_tool", "Paint bucket tool (optional)", "all"),
+           ("brush_tool", "Brush / pen tool (optional, with bucket)", "all"),
            ("brush_dec", "Brush size - arrow (optional)", "all"),
            ("brush_inc", "Brush size + arrow (optional)", "all")]
     FIELDS = [("spacing", "Line spacing (pt) - use Measure brush", float),
@@ -3338,6 +3400,9 @@ class App(QWidget):
         self.skip_white = QCheckBox("Skip white (canvas is white)")
         self.skip_white.setChecked(self.cfg["skip_white"])
         forms["Image"].addRow(self.skip_white)
+        self.use_bucket = QCheckBox("Bucket-fill the background (needs bucket + brush tool calibrated)")
+        self.use_bucket.setChecked(bool(self.cfg.get("use_bucket", True)))
+        forms["Image"].addRow(self.use_bucket)
         self.line_fill = QCheckBox("Follow thin shapes with lines (faster)")
         self.line_fill.setChecked(self.cfg.get("line_fill", True))
         forms["Image"].addRow(self.line_fill)
@@ -3430,6 +3495,7 @@ class App(QWidget):
             self.cfg[key] = val
         self.cfg["colors"] = max(1, min(256, self.cfg["colors"]))
         self.cfg["skip_white"] = self.skip_white.isChecked()
+        self.cfg["use_bucket"] = self.use_bucket.isChecked()
         self.cfg["line_fill"] = self.line_fill.isChecked()
         self.cfg["line_art"] = self.line_art.isChecked()
         self.cfg["hash_prefix"] = self.hash_prefix.isChecked()
