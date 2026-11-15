@@ -81,6 +81,12 @@ DEFAULTS = {
     "brush_min": None,       # brush size slider, left end
     "brush_max": None,       # brush size slider, right end
     "brush_pct": 10,         # fine brush slider position (0-100)
+    "brush_dec": None,       # optional brush size arrows (exact +-1 steps, for small brushes)
+    "brush_inc": None,
+    "arrow_curve": None,     # measured [(clicks above minimum, diameter pt)]
+    "brush_clicks": None,    # fine / big / tiny brush set by arrow clicks instead of the slider
+    "big_brush_clicks": None,
+    "tiny_brush_clicks": None,
     "big_brush_pct": 0,      # big brush slider position (0 = no big brush)
     "big_brush_pt": None,    # measured big brush diameter (screen points)
     "tiny_brush_pct": 0,     # tiny (edge) brush slider position (0 = no edge pass)
@@ -1626,10 +1632,36 @@ class Drawer:
         precise_sleep(self.cfg["color_wait_ms"] / 1000.0)
 
     def set_brush(self, pct):
+        """pct: slider position (0-100), or ("clicks", n): n arrow steps above the minimum."""
+        if isinstance(pct, (tuple, list)) and pct[0] == "clicks":
+            return self._brush_by_clicks(int(pct[1]))
+        self._clicks_at = None  # the slider moved: arrow position unknown
         (ax, ay), (bx, by) = self.cfg["brush_min"], self.cfg["brush_max"]
         f = max(0.0, min(1.0, pct / 100))
         self.press_at(ax + (bx - ax) * f, ay + (by - ay) * f)
         time.sleep(0.1)
+
+    def _brush_by_clicks(self, n):
+        """Exact small brush sizes with the arrows: go to the minimum once (slider far left,
+        then a few - clicks), then click + / - only the difference."""
+        if getattr(self, "_clicks_at", None) is None:
+            if self.cfg.get("brush_min") and self.cfg.get("brush_max"):
+                # jump near the minimum with the slider: the lowest slider position known to
+                # work (clicks at the very end of a slider are sometimes ignored), then - clicks
+                curve = self.cfg.get("brush_curve") or []
+                low = min((p for p, _ in curve), default=0.0)
+                (ax, ay), (bx, by) = self.cfg["brush_min"], self.cfg["brush_max"]
+                f = max(0.0, min(1.0, low / 100))
+                self.press_at(ax + (bx - ax) * f, ay + (by - ay) * f)
+            for _ in range(int(self.cfg.get("arrow_reset_clicks", 25))):  # extra clicks at the minimum do nothing
+                self.click(*self.cfg["brush_dec"])
+            self._clicks_at = 0
+        diff = n - self._clicks_at
+        btn = self.cfg["brush_inc"] if diff > 0 else self.cfg["brush_dec"]
+        for _ in range(abs(diff)):
+            self.click(*btn)
+        self._clicks_at = n
+        time.sleep(0.05)
 
     def activate(self):
         """First click on the game (Roblox may swallow it to focus the window)."""
@@ -1745,7 +1777,7 @@ class Drawer:
         cache, done_s = [], {}
         stream = plan if isinstance(plan, PlanStream) else None
         self.activate()
-        has_slider = bool(self.cfg["brush_min"] and self.cfg["brush_max"])
+        has_slider = bool(self.cfg["brush_min"] and self.cfg["brush_max"]) or has_arrows(self.cfg)
         pct = brush_pcts(self.cfg)
         cur_color, cur_size = None, None
         start = time.time()
@@ -1946,11 +1978,13 @@ class Drawer:
         tl, br = self.cfg["canvas_tl"], self.cfg["canvas_br"]
         has_slider = bool(self.cfg["brush_min"] and self.cfg["brush_max"])
         packer = DotPacker(tl, br)
-        dots = [("brush_pt", self.cfg["brush_pct"], self.cfg.get("brush_pt") or 20)]
+        bp = brush_pcts(self.cfg)
+        has_slider = has_slider or has_arrows(self.cfg)
+        dots = [("brush_pt", bp["fine"], self.cfg.get("brush_pt") or 20)]
         if has_slider and self.cfg["big_brush_pct"] > 0:
-            dots.append(("big_brush_pt", self.cfg["big_brush_pct"], self.cfg.get("big_brush_pt") or 60))
+            dots.append(("big_brush_pt", bp["big"], self.cfg.get("big_brush_pt") or 60))
         if has_slider and self.cfg["tiny_brush_pct"] > 0:
-            dots.append(("tiny_brush_pt", self.cfg["tiny_brush_pct"], self.cfg.get("tiny_brush_pt") or 10))
+            dots.append(("tiny_brush_pt", bp["tiny"], self.cfg.get("tiny_brush_pt") or 10))
         out = []
         for key, pct, guess in dots:
             side = min(max(16.0, guess * 1.5 + 10), packer.max_side())
@@ -1996,7 +2030,7 @@ class Drawer:
             return "full"
         side = min(side, packer.max_side())
         self.check()
-        if self.cfg.get("brush_min") and self.cfg.get("brush_max"):
+        if isinstance(pct, (tuple, list)) or (self.cfg.get("brush_min") and self.cfg.get("brush_max")):
             self.set_brush(pct)
         self.stroke([pos])
         br = self.cfg["canvas_br"]
@@ -2024,6 +2058,23 @@ class Drawer:
 
         self.activate()
         self.set_color("000000")
+        arrow_curve = []
+        if has_arrows(self.cfg):  # exact small sizes with the arrows first
+            self.status("Brush sweep: small sizes with the arrows...")
+            last_d = None
+            for n in (0, 1, 2, 3, 4, 6, 8, 11, 15, 20, 26):
+                g = 6.0 if last_d is None else last_d * 1.4 + 4
+                d = self.probe(packer, ("clicks", n), g)
+                if d == "big":
+                    d = self.probe(packer, ("clicks", n), g * 2.5 + 10)
+                if d == "full" or d == "big":
+                    break
+                if isinstance(d, float):
+                    arrow_curve.append((n, d))
+                    last_d = d
+                    self.status(f"Brush sweep: {n} clicks above minimum -> {d:.1f}pt")
+                    if d > 35:
+                        break
         sweep = (0, 1, 2, 3, 4, 6, 8, 13, 20, 30, 42, 56, 72, 100)  # low end too: the smallest brush matters
         self.status("Brush sweep: drawing test dots...")
         curve, seen_any, last = [], False, None
@@ -2049,9 +2100,16 @@ class Drawer:
             raise RuntimeError("Not enough room or no size change across the slider: check the canvas and "
                                "brush slider calibration (or clear the canvas and retry).")
 
-        targets = {k: t for k, t in pick_sizes(sorted(curve)).items() if t}
-        best = {}
+        targets = {k: t for k, t in pick_sizes(sorted(curve), arrow_curve).items() if t}
+        best, clicks = {}, {}
         pending = dict(targets)
+        acfg = dict(self.cfg, arrow_curve=arrow_curve)
+        for k, t in list(pending.items()):  # within the arrow range: exact steps, nothing to tune
+            hit = arrow_clicks_for(acfg, t)
+            if hit:
+                clicks[k] = hit[0]
+                best[k] = (0.5, hit[1])
+                pending.pop(k)
         for attempt in range(4):
             if not pending:
                 break
@@ -2081,7 +2139,8 @@ class Drawer:
                 best[k] = (round(p, 1), d)
         if "fine" not in best:
             raise RuntimeError("Couldn't measure the fine brush")
-        return {"fine": best["fine"], "big": best.get("big"), "tiny": best.get("tiny"), "curve": sorted(curve)}
+        return {"fine": best["fine"], "big": best.get("big"), "tiny": best.get("tiny"), "curve": sorted(curve),
+                "arrow_curve": arrow_curve, "clicks": clicks}
 
     @staticmethod
     def _pct_for(target, curve):
@@ -2507,9 +2566,33 @@ def brush_tiers(cfg):
     return tiers
 
 
+def has_arrows(cfg):
+    return bool(cfg.get("brush_dec") and cfg.get("brush_inc"))
+
+
+def arrow_clicks_for(cfg, d):
+    """Arrow clicks giving the brush closest to d (pt), if d is within the measured arrow range."""
+    ac = cfg.get("arrow_curve")
+    if not (has_arrows(cfg) and ac and d):
+        return None
+    if d > max(dd for _, dd in ac) * 1.08:
+        return None
+    return min(ac, key=lambda nd: abs(nd[1] - d))
+
+
+def curve_range(cfg, curve):
+    """Smallest and largest measured brush (slider and arrows)."""
+    ds = [d for _, d in curve] + [d for _, d in (cfg.get("arrow_curve") or [])] if has_arrows(cfg) else [d for _, d in curve]
+    return min(ds), max(ds)
+
+
 def brush_pcts(cfg):
-    """Slider position for every brush tag."""
+    """Slider position for every brush tag (or ("clicks", n) when set with the arrows)."""
     pct = {"fine": cfg["brush_pct"], "big": cfg.get("big_brush_pct", 0), "tiny": cfg.get("tiny_brush_pct", 0)}
+    if has_arrows(cfg):
+        for tag, key in (("fine", "brush_clicks"), ("big", "big_brush_clicks"), ("tiny", "tiny_brush_clicks")):
+            if cfg.get(key) is not None:
+                pct[tag] = ("clicks", int(cfg[key]))
     pct["line"] = pct["tiny"] if line_brush_pt(cfg) != (cfg.get("brush_pt") or cfg["spacing"] / 0.9) else pct["fine"]
     curve = cfg.get("brush_curve")
     for tag, d in brush_tiers(cfg):
@@ -2607,9 +2690,16 @@ def cfg_with_sizes(cfg, curve, fine, big, tiny):
     (curve=None: placeholder positions, enough for time estimates)."""
     pct = (lambda d: Drawer._pct_for(d, curve)) if curve else (lambda d: 1.0)
     c = dict(cfg)
+    # small sizes: exact arrow steps when available (the slider is coarse/unreliable down there)
+    hit = arrow_clicks_for(c, fine)
+    c["brush_clicks"] = hit[0] if hit else None
+    fine = hit[1] if hit else fine
     c["brush_pt"], c["spacing"] = fine, round(fine * 0.9, 1)
     c["brush_pct"] = round(pct(fine), 1)
     for key, d in (("big", big), ("tiny", tiny)):
+        hit = arrow_clicks_for(c, d) if d else None
+        c[f"{key}_brush_clicks"] = hit[0] if hit else None
+        d = hit[1] if hit else d
         c[f"{key}_brush_pt"] = d or None
         c[f"{key}_brush_pct"] = max(0.5, round(pct(d), 1)) if d else 0
     return c
@@ -2698,7 +2788,7 @@ def choose_sizes(img, cfg, curve, budget, emit=lambda m: None, prefetched=None):
     `prefetched` futures), then the pick is re-planned exactly.
     Returns (cfg_with_sizes, plan, est, sizes)."""
     curve = sorted(curve)
-    d_min, d_max = min(d for _, d in curve), max(d for _, d in curve)
+    d_min, d_max = curve_range(cfg, curve)
     # quick path: if the finest brush fits, nothing else needs planning
     finest = round(max(3.0, d_min), 1)
     sz0 = sizes_for(finest, d_min, d_max)
@@ -2863,7 +2953,7 @@ def _fit_to_time(img, cfg, budget, emit=lambda m: None):
     if cfg.get("brush_min") and cfg.get("brush_max") and curve and len(curve) >= 2:
         # speculatively plan the detail upgrades for the finest brush alongside (usually it fits)
         cv = sorted(curve)
-        d_min, d_max = min(d for _, d in cv), max(d for _, d in cv)
+        d_min, d_max = curve_range(cfg, cv)
         c_f = cfg_with_sizes(cfg, cv, *sizes_for(round(max(3.0, d_min), 1), d_min, d_max))
         spec = [(desc, dict(c_f, **chg), pool().submit(_plan_job, img, dict(c_f, **chg)))
                 for desc, chg in detail_levels(c_f)]
@@ -3039,7 +3129,9 @@ class App(QWidget):
            ("timer_tl", "Timer box top-left (optional)", "all"),
            ("timer_br", "Timer box bottom-right (optional)", "all"),
            ("brush_min", "Brush slider left end (optional)", "all"),
-           ("brush_max", "Brush slider right end (optional)", "all")]
+           ("brush_max", "Brush slider right end (optional)", "all"),
+           ("brush_dec", "Brush size - arrow (optional)", "all"),
+           ("brush_inc", "Brush size + arrow (optional)", "all")]
     FIELDS = [("spacing", "Line spacing (pt) - use Measure brush", float),
               ("brush_pct", "Fine brush slider position (0-100)", float),
               ("big_brush_pct", "Big brush slider position (0 = off)", float),
@@ -3451,9 +3543,10 @@ class App(QWidget):
         d_max = max((d for _, d in old), default=60.0)
         prefetched = prefetch_estimates(img, cfg, d_min, d_max)
 
-        def pick_sizes(curve):
+        def pick_sizes(curve, arrow_curve=None):
             budget = 0.93 * cfg["time_limit"]  # margin: real brush sizes differ slightly from targets
-            *_, (fine, big, tiny) = choose_sizes(img, cfg, curve, budget, emit, prefetched)
+            c2 = dict(cfg, arrow_curve=arrow_curve or cfg.get("arrow_curve"))
+            *_, (fine, big, tiny) = choose_sizes(img, c2, curve, budget, emit, None if arrow_curve else prefetched)
             return {"fine": fine, "big": big, "tiny": tiny}
 
         def job(d):
@@ -3594,6 +3687,12 @@ class App(QWidget):
 
     def apply_auto_brush(self, res):
         self.cfg["brush_curve"] = res.get("curve")  # reused by "Time left" fitting
+        if res.get("arrow_curve"):
+            self.cfg["arrow_curve"] = res["arrow_curve"]
+        cl = res.get("clicks") or {}
+        self.cfg["brush_clicks"] = cl.get("fine")
+        self.cfg["big_brush_clicks"] = cl.get("big")
+        self.cfg["tiny_brush_clicks"] = cl.get("tiny")
         fine_pct, fine_d = res["fine"]
         self.edits["brush_pct"][0].setText(str(fine_pct))
         for key, pct_key, pt_key in (("big", "big_brush_pct", "big_brush_pt"), ("tiny", "tiny_brush_pct", "tiny_brush_pt")):
@@ -3604,10 +3703,11 @@ class App(QWidget):
             else:
                 self.edits[pct_key][0].setText("0")
         self.set_brush_size("brush_pt", fine_d)  # also sets line spacing and saves
-        parts = [f"fine {fine_d:.1f}pt @ {fine_pct}%"]
+        where = lambda k, p: f"+{cl[k]} clicks" if k in cl else f"@ {p}%"
+        parts = [f"fine {fine_d:.1f}pt {where('fine', fine_pct)}"]
         for key in ("big", "tiny"):
             if res.get(key):
-                parts.append(f"{key} {res[key][1]:.1f}pt @ {res[key][0]}%")
+                parts.append(f"{key} {res[key][1]:.1f}pt {where(key, res[key][0])}")
         self.preview()
         self.set_status_main("Auto brush applied: " + ", ".join(parts) + " | " + self.status_label.text() +
                              ". Clear the canvas before drawing.")
