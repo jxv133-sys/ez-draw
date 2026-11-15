@@ -2638,7 +2638,10 @@ def find_errors(target, shot):
     Ls = np.empty(len(lab_shot), np.int64)
     for a in range(0, len(lab_shot), 200000):  # chunked nearest-color
         Ls[a:a + 200000] = ((lab_shot[a:a + 200000, None] - lab_obs[None]) ** 2).sum(2).argmin(1)
-    wrong = (Ls.reshape(Lt.shape) != Lt).astype(np.uint8)
+    # wrong = nearest to another color AND clearly off from how this color really looks
+    # (texture/noise and small shade differences aren't worth repainting)
+    off = np.sqrt(((lab_shot - lab_obs[Lt.reshape(-1)]) ** 2).sum(1)).reshape(Lt.shape) > 20
+    wrong = ((Ls.reshape(Lt.shape) != Lt) & off).astype(np.uint8)
     wrong = cv2.morphologyEx(wrong, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))  # drop edge seams
     n, comp, stats, _ = cv2.connectedComponentsWithStats(wrong, connectivity=8)
     keep = np.zeros(n, bool)
@@ -2654,7 +2657,7 @@ def correction_steps(target, shot, tried=None):
     gh, gw = Lt.shape[0] // HS, Lt.shape[1] // HS
     px = HS // SUB
     D = Lt[HS // 2::HS, px // 2::px][:gh, :gw * SUB]
-    bad = wrong.reshape(gh, HS, gw * SUB, px).mean(axis=(1, 3)) > 0.3
+    bad = wrong.reshape(gh, HS, gw * SUB, px).mean(axis=(1, 3)) > 0.5
     if tried is not None:
         bad &= ~tried
     is_bg = colors.min(1) >= 245
@@ -2662,7 +2665,10 @@ def correction_steps(target, shot, tried=None):
     frac = wrong.sum() / max(1, (drawn | wrong).sum())
     steps = []
     order = np.argsort(-np.bincount(Lt.reshape(-1), minlength=len(colors)))
+    lab_c, lab_o = _to_lab(colors.astype(np.float64)), _to_lab(observed)
     for i in order:
+        if not is_bg[i] and np.sqrt(((lab_c[i] - lab_o[i]) ** 2).sum()) > 25:
+            continue  # the game doesn't show this color right (e.g. dark shades turn black): repainting won't help
         T = (D == i) & bad
         if not T.any():
             continue
