@@ -625,18 +625,46 @@ def _shift(m, dy, dx):
     return out
 
 
-def _erode(m, offs):
-    out = m.copy()
+def _morph(m, offs, erode):
+    """out[y, x] = AND (erode) / OR (dilate) of m[y + dy, x + dx] over offs (False outside).
+    Offsets are grouped into horizontal runs per row; each run is one compare against a
+    run-length map (erode: True cells ending here; dilate: cells since the last True)."""
+    rows = {}
     for dy, dx in offs:
-        out &= _shift(m, dy, dx)
+        rows.setdefault(dy, set()).add(dx)
+    h, w = m.shape
+    P = max(abs(dx) for _, dx in offs) + 1
+    mp = np.zeros((h, w + 2 * P), bool)
+    mp[:, P:P + w] = m
+    idx = np.arange(w + 2 * P, dtype=np.int32)
+    if erode:  # L = length of the True run ending at x
+        L = idx - np.maximum.accumulate(np.where(mp, -1, idx), axis=1)
+    else:      # D = distance back to the last True (huge if none)
+        D = idx - np.maximum.accumulate(np.where(mp, idx, -10 ** 6), axis=1)
+    out = np.ones((h, w), bool) if erode else np.zeros((h, w), bool)
+    for dy, dxs in rows.items():
+        dxs = sorted(dxs)
+        a = dxs[0]
+        for p, q in zip(dxs, dxs[1:] + [None]):
+            if q == p + 1:
+                continue
+            b = p  # run a..b: window [x+a, x+b], judged at its right end x+b
+            if erode:
+                r = L[:, P + b:P + b + w] >= b - a + 1
+                out &= _shift(r, dy, 0)
+            else:
+                r = D[:, P + b:P + b + w] <= b - a
+                out |= _shift(r, dy, 0)
+            a = q
     return out
+
+
+def _erode(m, offs):
+    return _morph(m, offs, True)
 
 
 def _dilate(m, offs):
-    out = np.zeros_like(m)
-    for dy, dx in offs:
-        out |= _shift(m, dy, dx)
-    return out
+    return _morph(m, offs, False)
 
 
 def _segments(row):
@@ -1546,7 +1574,10 @@ class Drawer:
                 _post(Quartz.kCGEventLeftMouseDragged, x0, y0)
                 self.tick()
             held = held_corners(pts)
+            cut = getattr(self, "_cut_strokes", False) and self.deadline
             for vi, (x1, y1) in enumerate(pts[1:] or [pts[0]], 1):
+                if cut and time.time() > self.deadline:
+                    break  # time's up: lift the pen now (run() stops after this stroke)
                 px, py = x, y
                 dist = ((x1 - px) ** 2 + (y1 - py) ** 2) ** 0.5
                 steps = max(1, -(-int(dist) // int(seg)))
@@ -1727,9 +1758,11 @@ class Drawer:
         self._stage_override = stage
         self._upgrade = upgrade
         self._timing = {"pred": 0.0, "act": 0.0, "rows": [], "fit": [], "t0": time.time(), "clock": []}
+        self._cut_strokes = bool(costs)  # long strokes stop mid-way when time runs out
         try:
             self._run(plan, cx0, cy0, s, total, costs, skip_tiny, note)
         finally:
+            self._cut_strokes = False
             self.finished = True
             self._finish_timing()
 
@@ -2789,19 +2822,14 @@ def choose_sizes(img, cfg, curve, budget, emit=lambda m: None, prefetched=None):
     Returns (cfg_with_sizes, plan, est, sizes)."""
     curve = sorted(curve)
     d_min, d_max = curve_range(cfg, curve)
-    # quick path: if the finest brush fits, nothing else needs planning
-    finest = round(max(3.0, d_min), 1)
-    sz0 = sizes_for(finest, d_min, d_max)
-    c0 = cfg_with_sizes(cfg, curve, *sz0)
-    emit(f"Planning the finest brush ({finest:.1f}pt) first...")
-    plan0, e0 = plan_for(img, c0)
-    if e0 <= budget:
-        emit(f"Planning: fine brush {finest:.1f}pt -> ~{e0:.0f}s")
-        return c0, plan0, e0, sz0
+    # every size, the finest included, is planned in parallel (the finest alone can take ~30s)
     # finest option is the smallest brush itself (the edge pass then switches off: it needs a
     # clearly finer pen); time decides whether that or a bigger fine brush + edges wins
     lo_d, hi_d = max(3.0, d_min), max(3.0, min(d_max, 30))
     cands = [f for f in FINE_CANDIDATES if lo_d <= f <= hi_d] or [round(min(max(lo_d, 3.0), hi_d), 1)]
+    finest = round(min(lo_d, hi_d), 1)
+    if finest not in cands:
+        cands = sorted(cands + [finest])
     import concurrent.futures as cf
     futs = dict(prefetched or {})
     for f in sorted(cands, reverse=True):  # coarsest first: fastest to plan
@@ -2925,6 +2953,38 @@ def auto_settings(img, cfg, budget, emit=lambda m: None):
             err, est = best[0], best[1]
         emit(f"Auto settings: {key} = {c.get(key)} (look error {err:.2f}, ~{est:.0f}s)")
     return c, err, est, changes
+
+
+def auto_tune(img, cfg, budget, emit=lambda m: None):
+    """Quick per-picture tuning for Start: brush sizes from the measured slider, then 18
+    combinations of colors / shape smoothing / line art scored in parallel by how much the
+    rendered drawing looks like the picture. Returns (cfg, plan, seconds, description)."""
+    c = dict(cfg)
+    curve = c.get("brush_curve")
+    if curve and len(curve) >= 2 and ((c.get("brush_min") and c.get("brush_max")) or has_arrows(c)):
+        emit("Auto-tune: picking brush sizes...")
+        c, _, _, _ = choose_sizes(img, c, curve, budget, emit)
+    combos = [dict(c, colors=n, smooth=sm, line_art=la)
+              for n in (12, 20, 28) for sm in (0.5, 1.0, 1.5) for la in (True, False)]
+    emit(f"Auto-tune: trying {len(combos)} setting combinations...")
+    futs = [(cc, pool().submit(_quality_job, img, cc)) for cc in combos]
+    scored = []
+    for cc, f in futs:
+        try:
+            err, est = f.result()
+            scored.append((err, est, cc))
+        except Exception:
+            pass
+    fits = [t for t in scored if t[1] <= budget]
+    err, est, best = min(fits, key=lambda t: t[0]) if fits else min(scored, key=lambda t: t[1])
+    plan, est = plan_for(img, best)
+    if est > budget:  # nothing fit: simplify the best-looking pick until it does
+        emit("Auto-tune: no combination fits the time, simplifying...")
+        best, plan, est, d = fit_to_time(img, best, budget, emit)
+        return best, plan, est, f"auto-tuned + {d}"
+    desc = (f"auto-tuned: {best['colors']} colors, smoothing {best['smooth']}, "
+            f"line art {'on' if best['line_art'] else 'off'}, fine {best.get('brush_pt') or best['spacing'] / 0.9:.1f}pt")
+    return best, plan, est, desc
 
 
 _FIT_CACHE = {}
@@ -3140,7 +3200,7 @@ class App(QWidget):
               ("merge_de", "Merge colors closer than (0 = off, ~8)", float),
               ("line_contrast", "Line art: min contrast (lower = more lines)", float),
               ("smooth", "Simplify shapes (cells, 0 = off, ~1.5)", float),
-              ("time_limit", "Auto brush: time limit (s)", float),
+              ("time_limit", "Drawing time limit (s)", float),
               ("correct_passes", "Screenshot correction passes (0 = off)", int),
               ("corner_frames", "Hold each corner (frames)", int),
               ("min_frame_ms", "Fastest event delay when late (ms)", int),
@@ -3301,6 +3361,12 @@ class App(QWidget):
         self.time_left.setToolTip("Optional. Seconds left in the round: the drawing is re-planned to finish in time.")
         self.time_left.setMaximumWidth(110)
         bar.addWidget(self.time_left)
+        self.autotune = QCheckBox("Auto-tune")
+        self.autotune.setToolTip("Before drawing, pick brush sizes and settings for this picture "
+                                 "(colors, smoothing, line art) that look best within the time.")
+        self.autotune.setChecked(bool(self.cfg.get("autotune", False)))
+        self.autotune.toggled.connect(lambda v: (self.cfg.update(autotune=bool(v)), self.save()))
+        bar.addWidget(self.autotune)
         self.start_btn = QPushButton("Start drawing (5s)")
         self.start_btn.clicked.connect(self.start)
         bar.addWidget(self.start_btn, 1)
@@ -3778,68 +3844,53 @@ class App(QWidget):
                 return
             left = str(secs)
             self.set_status_main(f"Timer reads {secs // 60}:{secs % 60:02d}")
-        if not left:
-            try:
-                self.read_settings()
-                self.missing_calibration()
-                tl, br = self.cfg["canvas_tl"], self.cfg["canvas_br"]
-                if br[0] <= tl[0] or br[1] <= tl[1]:
-                    raise ValueError("Bottom-right must be below and right of top-left")
-                img = self.source_image()
-                img.load()
-            except Exception as e:
-                self.error(str(e))
-                return
-            if self.can_repick(img):
-                # pick brush sizes for this picture (fit the Auto brush time limit) from the saved
-                # slider table - no test dots - while the countdown runs
-                cfg, state = dict(self.cfg), {}
-
-                def prepare(note):
-                    c, plan, est, desc = fit_to_time(img, cfg, 0.93 * cfg["time_limit"],
-                                                     lambda m: note.update(msg=m))
-                    state["plan"] = plan
-                    note["msg"] = f"brushes for this picture: {desc}, ~{est:.0f}s"
-                    return c
-
-                self.launch(lambda d: self.draw_and_correct(d, img, state["plan"]), prepare,
-                            stages=self.draw_stages(self.cfg))
-                return
-            steps = stream_plan(img, dict(self.cfg))  # plans during the countdown / while drawing
-            self.launch(lambda d: self.draw_and_correct(d, img, steps), stages=self.draw_stages(self.cfg),
-                        planning=True)
-            return
         try:
-            total = float(left.replace("s", "").split(":")[-1]) + (
-                60 * float(left.split(":")[0]) if ":" in left else 0)  # "95" or "1:35"
             self.read_settings()
             self.missing_calibration()
+            tl, br = self.cfg["canvas_tl"], self.cfg["canvas_br"]
+            if br[0] <= tl[0] or br[1] <= tl[1]:
+                raise ValueError("Bottom-right must be below and right of top-left")
             img = self.source_image()
             img.load()
+            if left:  # game time ("95" or "1:35")
+                total = float(left.replace("s", "").split(":")[-1]) + (
+                    60 * float(left.split(":")[0]) if ":" in left else 0)
+            else:  # no clock given: the drawing time limit is the deadline
+                total = float(self.cfg["time_limit"]) + 6.5
         except Exception as e:
-            self.error(f"Time left: {e}")
+            self.error(str(e))
             return
         clicked = time.time()
         cfg = dict(self.cfg)
         state = {}
-
-        rate = float(cfg.get("game_rate") or 1.0)  # game seconds per real second (learned)
+        rate = float(cfg.get("game_rate") or 1.0) if left else 1.0  # game seconds per real second
+        tune = self.autotune.isChecked()
+        exact = not left and not tune and not self.can_repick(img)  # use these exact settings
 
         def left_for_drawing():
-            # fitting runs during the 5s countdown; drawing starts when both are done (+~1.5s clicks)
+            # planning runs during the 5s countdown; drawing starts when both are done (+~1.5s clicks)
             return total / rate - max(5.0, time.time() - clicked) - 1.5
 
         def prepare(note):
             budget = left_for_drawing()
-            for _ in range(2):
-                c, plan, est, desc = fit_to_time(img, cfg, 0.93 * budget, lambda m: note.update(msg=m))
-                remaining = left_for_drawing()
-                if est <= remaining or budget <= 5:
-                    break
-                budget = remaining - (est - remaining) - 2  # fitting ran long: tighten once
+            say = lambda m: note.update(msg=m)
+            if tune:
+                c, plan, est, desc = auto_tune(img, cfg, 0.93 * budget, say)
+            elif exact:
+                plan, est = plan_for(img, cfg)
+                c, desc = cfg, "your settings"
+                if est > budget:  # too much for the time: simplify instead of overrunning
+                    c, plan, est, desc = fit_to_time(img, cfg, 0.93 * budget, say)
+            else:
+                for _ in range(2):
+                    c, plan, est, desc = fit_to_time(img, cfg, 0.93 * budget, say)
+                    if est <= left_for_drawing() or budget <= 5:
+                        break
+                    budget = left_for_drawing() - (est - left_for_drawing()) - 2  # planning ran long
+            remaining = left_for_drawing()
             state["plan"] = plan
-            note["msg"] = (f"fitted to {remaining:.0f}s: {desc}, ~{est:.0f}s"
-                           + ("" if est <= remaining else " (won't fully fit!)"))
+            note["msg"] = (f"{desc}, ~{est:.0f}s of {remaining:.0f}s"
+                           + ("" if est <= remaining else " (won't fully fit: will simplify while drawing)"))
             return c
 
         self.launch(lambda d: self.draw_and_correct(d, img, state["plan"], clicked + total / rate), prepare,
