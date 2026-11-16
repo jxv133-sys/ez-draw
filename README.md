@@ -20,6 +20,7 @@ Grant the app running the script (e.g. Terminal) these permissions in System Set
 2. **Tools tab**: **Auto brush**, **Auto speed** and **Color check** once per game (results are saved in `config.json`).
 3. Copy an image, press **Paste image**, then **Start drawing**. With the timer box calibrated it fits the drawing to the time left; otherwise it fits the **Drawing time limit** (Settings). The progress panel shows planning progress, time left and how much time is to spare.
 4. With the paint bucket calibrated, the background color is filled in one click (start on a blank canvas).
-5. Tick **Auto-tune** (next to Start) to pick brush sizes, colors, smoothing and line art automatically for each picture.
+5. **Library tab > Pre-plan...**: plan the selected pictures ahead for a round length. Start then draws them with no planning wait, so the whole round goes to drawing. Plans are thrown out when brush, color, canvas or speed settings change.
+6. Tick **Auto-tune** (next to Start) to pick brush sizes, colors, smoothing and line art automatically for each picture.
 
 Press **Esc** (or move the mouse) to stop.

@@ -2461,6 +2461,12 @@ class Drawer:
                 self.progress("correct", -2, "skipped: needs Screen Recording", "")
                 return
             if i == 0:
+                sh = misaligned(target, shot)
+                if sh:
+                    self.status(f"Correction skipped: the canvas looks shifted by {sh[0]},{sh[1]} cells from the "
+                                "calibration (camera moved?) - repainting would smear the drawing")
+                    self.progress("correct", -2, "skipped: canvas doesn't line up", "")
+                    return
                 _, cols_, obs_, _ = find_errors(target, shot)
                 off = [(c_, o_) for c_, o_ in zip(cols_, obs_) if min(c_) < 245 and
                        np.sqrt(((_to_lab(c_[None].astype(float)) - _to_lab(o_[None].astype(float))) ** 2).sum()) > 25]
@@ -2471,6 +2477,11 @@ class Drawer:
                     time.sleep(1.5)
             steps, frac, cells = correction_steps(target, shot, tried)
             n = sum(len(st) for _, _, st in steps)
+            if frac > 0.25:  # this much wrong isn't drawing mistakes: something covers the canvas
+                self.status(f"Correction skipped: {frac:.0%} of the screenshot doesn't match the drawing "
+                            "(something covering the canvas, or the camera moved)")
+                self.progress("correct", -2, "skipped: screen doesn't match", "")
+                return
             if frac < 0.01 or not n or (last_frac is not None and frac > 0.75 * last_frac):
                 self.status(f"Check {i + 1}: {frac:.1%} of the drawing is off - done")
                 self.progress("correct", 1.0, f"done: {frac:.1%} off", "")
@@ -2625,8 +2636,9 @@ class Drawer:
         return True
 
     def _wipe_slots(self, used, w, h, b, cfg):
-        """Paint the used test spots white so a small canvas can be reused. Checks with a
-        screenshot; False if the ink still shows (see-through paint)."""
+        """Clear the used test spots so a small canvas can be reused: paint bucket if
+        calibrated, else (or if ink is left) brush white over them. Checks with a screenshot;
+        False if the ink still shows (see-through paint)."""
         tl, br = cfg["canvas_tl"], cfg["canvas_br"]
         x0 = max(tl[0] + 1, min(x for x, _ in used) - 3)
         y0 = max(tl[1] + 1, min(y for _, y in used) - 3)
@@ -2638,7 +2650,38 @@ class Drawer:
         self.frame = self.frame0 = self.min_frame = self.cfg["frame_ms"] / 1000.0
         self.t = time.perf_counter()
         clean = False
+
+        def ink_left():
+            """Leftover ink mask and screenshot scale, or None if the screenshot failed."""
+            self.move(br[0] - 3, br[1] - 3)
+            time.sleep(0.35)
+            cap = capture(x0, y0, x1 - x0, y1 - y0)
+            return None if cap is None else ((cap[0].astype(np.int16).min(2) < 200).astype(np.uint8), cap[1])
+
+        def is_clean():
+            r = ink_left()
+            return None if r is None else r[0].mean() < 0.001
+
         try:
+            if cfg.get("bucket_tool") and cfg.get("brush_tool"):
+                # two clicks: black over the background joins it with the black test ink,
+                # then white over all of it clears the whole canvas
+                self.status("Auto speed - out of room: clearing the canvas with the paint bucket")
+                corner = (tl[0] + 2.5, tl[1] + 2.5)  # tests start 5pt in: always background
+                for hx in ("000000", "ffffff"):
+                    self.set_color(hx)
+                    self.bucket_fill(*corner)
+                r = ink_left()
+                if r is not None and r[0].mean() >= 0.001:
+                    # islands the black didn't join (other colors): one white fill on each
+                    n, comp, stats, cent = cv2.connectedComponentsWithStats(r[0], connectivity=8)
+                    for i in sorted(range(1, n), key=lambda i: -stats[i, cv2.CC_STAT_AREA])[:40]:
+                        ys, xs = np.nonzero(comp == i)
+                        k = int(np.argmin((xs - cent[i][0]) ** 2 + (ys - cent[i][1]) ** 2))
+                        self.bucket_fill(x0 + xs[k] / r[1], y0 + ys[k] / r[1])
+                    r = ink_left()
+                if r is not None and r[0].mean() < 0.001:
+                    return True
             self.status("Auto speed - out of room: painting the tests over")
             self.set_color("ffffff")
             for k in range(3):
@@ -2648,13 +2691,10 @@ class Drawer:
                     yy = min(y1 - b / 2, y0 + b / 2 + off + i * (y1 - y0 - b) / max(1, rows - 1))
                     a, c = (x0 + b / 2, x1 - b / 2) if i % 2 == 0 else (x1 - b / 2, x0 + b / 2)
                     self.stroke([(a, yy), (c, yy)])
-                self.move(br[0] - 3, br[1] - 3)
-                time.sleep(0.35)
-                cap = capture(x0, y0, x1 - x0, y1 - y0)
-                if cap is None:
+                res = is_clean()
+                if res is None:
                     break
-                ink = cap[0].astype(np.int16).min(2) < 200
-                if ink.mean() < 0.001:
+                if res:
                     clean = True
                     break
         finally:
@@ -2851,6 +2891,42 @@ def find_errors(target, shot):
     return Lt, colors, observed, keep[comp]
 
 
+def _paint_for_look(look, asked, seen):
+    """Paint color that shows up as `look`, from how the painted colors came out (per-channel
+    straight-line fit asked -> seen). Too few colors to fit: the look itself."""
+    look = np.asarray(look, float)
+    if len(asked) < 3:
+        return look
+    out = look.copy()
+    for c in range(3):
+        x, y = np.asarray(asked, float)[:, c], np.asarray(seen, float)[:, c]
+        if np.ptp(x) < 60:
+            continue
+        a, b = np.polyfit(x, y, 1)
+        if 0.5 < a < 1.5:
+            out[c] = (look[c] - b) / a
+    return np.clip(out, 0, 255)
+
+
+def misaligned(target, shot, max_cells=2):
+    """(dx, dy) cells if the screenshot lines up clearly better with the target shifted
+    (canvas calibration off or the camera moved), else None."""
+    small = lambda a: cv2.resize(a, (a.shape[1] // HS, a.shape[0] // HS), interpolation=cv2.INTER_AREA)
+    T = _to_lab(small(target).reshape(-1, 3).astype(float)).reshape(target.shape[0] // HS, -1, 3)
+    S = _to_lab(small(shot).reshape(-1, 3).astype(float)).reshape(T.shape)
+    m = max_cells
+    if T.shape[0] <= 4 * m or T.shape[1] <= 4 * m:
+        return None
+    core = (slice(m, -m), slice(m, -m))
+    errs = {}
+    for dy in range(-m, m + 1):
+        for dx in range(-m, m + 1):
+            Ss = S[m + dy:S.shape[0] - m + dy, m + dx:S.shape[1] - m + dx]
+            errs[(dx, dy)] = np.sqrt(((T[core] - Ss) ** 2).sum(2)).mean()
+    best = min(errs, key=errs.get)
+    return best if best != (0, 0) and errs[best] < 0.7 * errs[(0, 0)] else None
+
+
 def correction_steps(target, shot, tried=None):
     """Repaint steps for every wrongly colored area (fine brush, kept inside its own color).
     tried: fill-grid cells already repainted once (still wrong = finer than the brush; skipped).
@@ -2874,8 +2950,9 @@ def correction_steps(target, shot, tried=None):
         T = (D == i) & bad
         if not T.any():
             continue
-        # background spills are painted over with the canvas's measured color
-        rgb = observed[i] if is_bg[i] else colors[i]
+        # background spills: paint the canvas color. Its screenshot look is shifted by the
+        # game's lighting and the screen, so undo the shift measured on the painted colors
+        rgb = _paint_for_look(observed[i], colors[~is_bg], observed[~is_bg]) if is_bg[i] else colors[i]
         hx = "{:02x}{:02x}{:02x}".format(*[int(round(v)) for v in np.clip(rgb, 0, 255)])
         strokes = _fill_strokes(D == i, T)
         if strokes:
@@ -3407,6 +3484,101 @@ def fit_to_time(img, cfg, budget, emit=lambda m: None):
     return res
 
 
+# ---- pre-made plans: plan a picture ahead of a round, Start then draws it with no planning ----
+
+PLAN_DIR = os.path.join(LIB_DIR, ".plans")
+# settings that don't change the plan itself: a stored plan stays valid when only these change
+PLAN_FREE_KEYS = {"time_limit", "time_factor", "timing_model", "game_rate", "correct_passes", "autotune",
+                  "auto_settings_for", "timer_tl", "timer_br", "focus_spot", "key_ms"}
+
+
+def plan_settings_key(cfg):
+    """Everything a plan depends on (brushes, colors, canvas, image and timing settings)."""
+    import hashlib
+    keep = {k: cfg[k] for k in sorted(cfg) if k not in PLAN_FREE_KEYS and not k.startswith("_")}
+    return hashlib.md5(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def picture_id(img):
+    import hashlib
+    rgb = img.convert("RGB")
+    return hashlib.md5(rgb.tobytes() + repr(rgb.size).encode()).hexdigest()
+
+
+def _plan_file(img):
+    return os.path.join(PLAN_DIR, picture_id(img) + ".pkl")
+
+
+def preplan_index():
+    """{picture id: [{"key", "window", "tune", "est"}]} - what's stored, without loading plans."""
+    try:
+        with open(os.path.join(PLAN_DIR, "index.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _index_set(pid, entries):
+    idx = preplan_index()
+    if entries:
+        idx[pid] = [{k: e[k] for k in ("key", "window", "tune", "est")} for e in entries]
+    else:
+        idx.pop(pid, None)
+    try:
+        os.makedirs(PLAN_DIR, exist_ok=True)
+        with open(os.path.join(PLAN_DIR, "index.json"), "w") as f:
+            json.dump(idx, f)
+    except OSError:
+        pass
+
+
+def load_preplans(img, cfg):
+    """Stored plans for this picture still valid for cfg: [{"window", "tune", "est", "result"}].
+    Plans made with other settings are dropped from the file."""
+    import pickle
+    path = _plan_file(img)
+    try:
+        with open(path, "rb") as f:
+            entries = pickle.load(f)
+    except (OSError, EOFError, pickle.UnpicklingError, AttributeError, ImportError):
+        return []
+    key = plan_settings_key(cfg)
+    good = [e for e in entries if e.get("key") == key]
+    if len(good) != len(entries):
+        try:
+            if good:
+                with open(path, "wb") as f:
+                    pickle.dump(good, f)
+            else:
+                os.remove(path)
+        except OSError:
+            pass
+        _index_set(os.path.basename(path)[:-4], good)
+    return good
+
+
+def save_preplan(img, cfg, window, tune, result):
+    """Keep one plan per (window, auto-tune) for this picture."""
+    import pickle
+    os.makedirs(PLAN_DIR, exist_ok=True)
+    entries = [e for e in load_preplans(img, cfg) if not (e["window"] == window and e["tune"] == tune)]
+    entries.append({"key": plan_settings_key(cfg), "window": window, "tune": tune, "est": result[2],
+                    "result": result, "made": time.time()})
+    with open(_plan_file(img), "wb") as f:
+        pickle.dump(entries, f)
+    _index_set(picture_id(img), entries)
+
+
+def pick_preplan(img, cfg, tune, avail):
+    """The most detailed stored plan that fits `avail` drawing seconds: (cfg, plan, est, desc) or None."""
+    fits = [e for e in load_preplans(img, cfg) if e["tune"] == tune and e["est"] <= avail]
+    if not fits:
+        return None
+    c, plan, est, desc = max(fits, key=lambda e: e["est"])["result"]
+    c = dict(c, **{k: cfg[k] for k in PLAN_FREE_KEYS if k in cfg})  # current timer/calibration extras
+    return c, plan, est, desc
+
+
 def _fit_to_time(img, cfg, budget, emit=lambda m: None):
     """Settings + plan that finish within `budget` seconds. Uses the measured brush curve to
     pick brush sizes when available (more time = finer brushes); otherwise trims the edge pass
@@ -3682,6 +3854,7 @@ class Bridge(QObject):
     auto_done = Signal(dict)
     preview_done = Signal(int, object)
     lib_scored = Signal(str, object)
+    lib_planned = Signal(str, object)
 
 
 class ClickCatcher(QObject):
@@ -3899,7 +4072,7 @@ class App(QWidget):
                           "your current brushes (higher is better); drop image files here to add them."))
         row = QHBoxLayout()
         for text, fn in [("Save pasted", self.lib_add_clipboard), ("Add files...", self.lib_add_files),
-                         ("Score all", self.lib_score_all)]:
+                         ("Score all", self.lib_score_all), ("Pre-plan...", self.lib_preplan)]:
             b = QPushButton(text)
             b.clicked.connect(fn)
             row.addWidget(b)
@@ -3907,7 +4080,8 @@ class App(QWidget):
         self.lib_list = QListWidget()
         self.lib_list.setViewMode(QListView.IconMode)
         self.lib_list.setIconSize(QSize(104, 104))
-        self.lib_list.setGridSize(QSize(124, 150))
+        self.lib_list.setGridSize(QSize(124, 164))
+        self.lib_list.setSelectionMode(QListView.ExtendedSelection)  # Cmd-click: pre-plan several
         self.lib_list.setResizeMode(QListView.Adjust)
         self.lib_list.setMovement(QListView.Static)
         self.lib_list.setWordWrap(True)
@@ -3929,6 +4103,8 @@ class App(QWidget):
         tabs.addTab(lib, "Library")
         self.setAcceptDrops(True)
         self.bridge.lib_scored.connect(self.lib_on_scored)
+        self.bridge.lib_planned.connect(self.lib_on_planned)
+        self.lib_planning = set()
         self.lib_scores, self.lib_scoring = self.lib_load_scores(), set()
         self.lib_refresh()
 
@@ -4315,20 +4491,24 @@ class App(QWidget):
         cur = self.image_path
         self.lib_list.clear()
         limit = float(self.cfg.get("time_limit") or 0)
+        pidx, pkey = preplan_index(), plan_settings_key(self.cfg)
         for p in files:
             mt = os.path.getmtime(p)
             icon = self._lib_thumbs.get(p)
             if icon is None or icon[0] != mt:
+                pid = None
                 try:
                     im = Image.open(p)
+                    pid = picture_id(im)
                     im = ImageOps.exif_transpose(im).convert("RGBA")
                     im.thumbnail((104, 104))
                     data = im.tobytes("raw", "RGBA")
                     q = QImage(data, im.width, im.height, 4 * im.width, QImage.Format_RGBA8888).copy()
-                    icon = (mt, QIcon(QPixmap.fromImage(q)))
+                    icon = (mt, QIcon(QPixmap.fromImage(q)), pid)
                 except Exception:
-                    icon = (mt, QIcon())
+                    icon = (mt, QIcon(), pid)
                 self._lib_thumbs[p] = icon
+            windows = sorted({e["window"] for e in pidx.get(icon[2], []) if e["key"] == pkey})
             name = os.path.splitext(os.path.basename(p))[0]
             sc = self.lib_score_of(p)
             if p in self.lib_scoring:
@@ -4337,6 +4517,10 @@ class App(QWidget):
                 sub = f"fit {self.fit_of(sc['err'])} \u00b7 ~{sc['est']:.0f}s" + (" \u26a0" if limit and sc["est"] > limit else "")
             else:
                 sub = "not scored"
+            if p in self.lib_planning:
+                sub += "\npre-planning..."
+            elif windows:
+                sub += "\n\u2713 planned " + ", ".join(f"{w}s" for w in windows)
             it = QListWidgetItem(icon[1], f"{name[:18]}\n{sub}")
             it.setData(Qt.UserRole, p)
             it.setToolTip(f"{os.path.basename(p)}\n{sub}" + ("\n\u26a0 takes longer than the time limit with "
@@ -4456,6 +4640,56 @@ class App(QWidget):
                 except Exception as e:
                     self.bridge.lib_scored.emit(p, e)
         threading.Thread(target=work, daemon=True).start()
+
+    def lib_preplan(self):
+        """Plan the selected pictures now for a round of a given length, so Start draws them
+        with no planning wait (the whole round goes to drawing)."""
+        paths = [it.data(Qt.UserRole) for it in self.lib_list.selectedItems()]
+        paths = [p for p in paths if p and os.path.exists(p) and p not in self.lib_planning]
+        if not paths:
+            return self.error("Select one or more pictures first (Cmd-click for several).")
+        try:
+            self.plan_checks()
+        except Exception as e:
+            return self.error(str(e))
+        timer_set = bool(self.cfg.get("timer_tl") and self.cfg.get("timer_br"))
+        ask = ("Seconds on the round timer when you'll press Start:" if timer_set
+               else "Seconds to draw in (the Drawing time limit when you press Start):")
+        window, ok = QInputDialog.getInt(self, "Pre-plan", ask, int(float(self.cfg.get("time_limit") or 90)), 10, 3600)
+        if not ok:
+            return
+        cfg, tune = dict(self.cfg), self.autotune.isChecked()
+        rate = float(cfg.get("game_rate") or 1.0) if timer_set else 1.0
+        lead = 0.5 if cfg.get("focus_spot") else 5.0
+        # the drawing time Start will have (see start(): countdown/focus lead and ~1.5s of clicks)
+        budget = window / rate - lead - 1.5 if timer_set else window
+        self.lib_planning.update(paths)
+        self.lib_refresh()
+
+        def work():
+            boost_thread()
+            for i, p in enumerate(paths, 1):
+                self.bridge.status.emit(f"Pre-planning {os.path.basename(p)} ({i}/{len(paths)}) for {window}s...")
+                try:
+                    img = Image.open(p)
+                    img.load()  # as Start opens it (same planning input)
+                    res = auto_tune(img, cfg, 0.93 * budget) if tune else fit_to_time(img, cfg, 0.93 * budget)
+                    save_preplan(img, cfg, window, tune, res)
+                    self.bridge.lib_planned.emit(p, (window, res[2], res[3]))
+                except Exception as e:
+                    self.bridge.lib_planned.emit(p, e)
+        threading.Thread(target=work, daemon=True).start()
+
+    def lib_on_planned(self, p, res):
+        self.lib_planning.discard(p)
+        name = os.path.basename(p)
+        if isinstance(res, Exception):
+            self.set_status_main(f"Pre-planning {name} failed: {res}")
+        else:
+            w, est, desc = res
+            self.set_status_main(f"Pre-planned {name} for {w}s: {desc}, ~{est:.0f}s"
+                                 + ("" if self.lib_planning else " - Start will draw it right away"))
+        self.lib_refresh()
 
     def lib_on_scored(self, p, res):
         self.lib_scoring.discard(p)
@@ -4939,6 +5173,15 @@ class App(QWidget):
 
         def prepare(note):
             budget = left_for_drawing()
+            hit = None if exact else pick_preplan(img, cfg, tune, budget)
+            if hit:  # planned ahead (Library > Pre-plan): draw right away
+                PLAN_METER.reset(1)
+                PLAN_METER.tick()
+                c, plan, est, desc = hit
+                note["planned"] = True
+                state["plan"] = plan
+                note["msg"] = f"pre-planned: {desc}, ~{est:.0f}s of {budget:.0f}s"
+                return c
             PLAN_METER.reset(2 if exact else search_guess(cfg, tune))
             if not early:
                 c, plan, est, desc = plan_full(note, budget, cfg)
