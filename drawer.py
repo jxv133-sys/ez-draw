@@ -2624,6 +2624,45 @@ class Drawer:
                 return False
         return True
 
+    def _wipe_slots(self, used, w, h, b, cfg):
+        """Paint the used test spots white so a small canvas can be reused. Checks with a
+        screenshot; False if the ink still shows (see-through paint)."""
+        tl, br = cfg["canvas_tl"], cfg["canvas_br"]
+        x0 = max(tl[0] + 1, min(x for x, _ in used) - 3)
+        y0 = max(tl[1] + 1, min(y for _, y in used) - 3)
+        x1 = min(br[0] - 1, max(x for x, _ in used) + w + 3)
+        y1 = min(br[1] - 1, max(y for _, y in used) + h + 3)
+        saved = (self.cfg, self.frame, self.frame0, self.min_frame)
+        self.cfg = dict(cfg, frame_ms=max(8, cfg["frame_ms"]), segment=min(cfg["segment"], 12.0),
+                        corner_frames=max(2, cfg["corner_frames"]))
+        self.frame = self.frame0 = self.min_frame = self.cfg["frame_ms"] / 1000.0
+        self.t = time.perf_counter()
+        clean = False
+        try:
+            self.status("Auto speed - out of room: painting the tests over")
+            self.set_color("ffffff")
+            for k in range(3):
+                rows = max(2, int(math.ceil((y1 - y0 - b) / (0.6 * b))) + 1)
+                off = (k % 2) * 0.3 * b  # each extra pass between the previous rows
+                for i in range(rows):
+                    yy = min(y1 - b / 2, y0 + b / 2 + off + i * (y1 - y0 - b) / max(1, rows - 1))
+                    a, c = (x0 + b / 2, x1 - b / 2) if i % 2 == 0 else (x1 - b / 2, x0 + b / 2)
+                    self.stroke([(a, yy), (c, yy)])
+                self.move(br[0] - 3, br[1] - 3)
+                time.sleep(0.35)
+                cap = capture(x0, y0, x1 - x0, y1 - y0)
+                if cap is None:
+                    break
+                ink = cap[0].astype(np.int16).min(2) < 200
+                if ink.mean() < 0.001:
+                    clean = True
+                    break
+        finally:
+            self.set_color("000000")
+            self.cfg, self.frame, self.frame0, self.min_frame = saved
+            self.t = time.perf_counter()
+        return clean
+
     def auto_speed(self):
         """Try ever faster timing on test patterns, keep the fastest that draws correctly.
         Returns (settings dict, log lines)."""
@@ -2634,14 +2673,33 @@ class Drawer:
         w, h = length * 1.33 + 2 * b, 16 * b
         slots = [(float(x), float(y)) for y in np.arange(tl[1] + 5, br[1] - h, h + 8)
                  for x in np.arange(tl[0] + 5, br[0] - w, w + 8)]
-        if len(slots) < 3:
-            raise RuntimeError("Canvas too small for speed tests (needs room for 3 test patterns)")
-        slot = iter(slots)
+        if not slots:
+            raise RuntimeError("Canvas too small for speed tests - calibrate the canvas corners again")
         log = []
         cur = {k: base[k] for k in ("frame_ms", "corner_frames", "segment", "color_wait_ms")}
+        room = {"left": iter(slots), "used": [], "safe": dict(cur), "wipes": 0}
+
+        def next_slot():
+            """Next free test spot. Small canvas: when all are used, paint them white and reuse."""
+            if room.get("full"):
+                return None
+            pos = next(room["left"], None)
+            if pos is None and room["used"]:
+                if room["wipes"] >= 20 or not self._wipe_slots(room["used"], w, h, b, dict(base, **room["safe"])):
+                    room["full"] = True
+                    log.append("out of canvas room (couldn't paint the tests over): stopped early - "
+                               "clear the canvas and run again to test faster settings")
+                    return None
+                room["wipes"] += 1
+                log.append("small canvas: painted the tests over to reuse the space")
+                room["left"], room["used"] = iter(slots), []
+                pos = next(room["left"], None)
+            if pos is not None:
+                room["used"].append(pos)
+            return pos
 
         def trial(label, **chg):
-            pos = next(slot, None)
+            pos = next_slot()
             if pos is None:
                 return None
             st = dict(cur, **chg)
@@ -2668,6 +2726,8 @@ class Drawer:
             self.status(f"Auto speed - {label}: {'pass' if ok else 'fail'}")
             if ok:
                 cur.update(chg)
+                if "frame_ms" not in chg:  # wipes use settings that drew cleanly, at a calm speed
+                    room["safe"].update(chg)
             return ok
 
         self.activate()
