@@ -718,6 +718,75 @@ def _fine_runs(allowed_row, target_row, k, open_l=False, open_r=False):
     return out
 
 
+PRUNE_GAP = 10.0   # cells: a redundant stretch shorter than this is drawn through (lifting costs more)
+PRUNE_NEED = 0.12  # share of a brush footprint that must change for that part of a stroke to stay
+
+
+def _paint_hi(canvas, col, strokes, r):
+    """Paint strokes (hi-res px polylines) with a round brush of radius r px onto canvas."""
+    th, rr = max(1, int(round(2 * r))), max(1, int(r * 16))
+    for P in strokes:
+        P = np.round(np.asarray(P, np.float64) * 16).astype(np.int32)
+        if len(P) > 1:
+            cv2.polylines(canvas, [P], False, col, th, cv2.LINE_8, 4)
+        for q in (P[[0, -1]] if len(P) > 1 else P):
+            cv2.circle(canvas, (int(q[0]), int(q[1])), rr, col, -1, cv2.LINE_8, 4)
+
+
+def _cut_polyline(P, cum, a, b):
+    """Part of polyline P (n x 2, cumulative lengths cum) between arc lengths a and b."""
+    def at(s):
+        i = min(max(int(np.searchsorted(cum, s, side="right")) - 1, 0), len(P) - 2)
+        seg = cum[i + 1] - cum[i]
+        t = 0.0 if seg <= 0 else (s - cum[i]) / seg
+        return P[i] + (P[i + 1] - P[i]) * min(max(t, 0.0), 1.0)
+    inner = [P[i] for i in range(len(P)) if a < cum[i] < b]
+    return np.array([at(a)] + inner + [at(b)])
+
+
+def _prune_strokes(canvas, tgt, col, strokes, r, cell):
+    """Drop the parts of strokes (hi-res px) that only paint pixels already showing col, or
+    pixels that shouldn't be col. Ends are trimmed; a redundant stretch in the middle is cut
+    out only if it is longer than PRUNE_GAP cells. Returns the kept strokes."""
+    U = (canvas != col).any(2) & (tgt == col).all(2)
+    if not U.any():
+        return []
+    H, W = U.shape
+    I = np.zeros((H + 1, W + 1), np.int32)
+    I[1:, 1:] = U.cumsum(0).cumsum(1)
+    k = max(1, int(round(r * 0.8)))      # box inside the brush footprint
+    need = max(3, int(PRUNE_NEED * (2 * k + 1) ** 2))
+    step = max(1.0, cell / 2)
+    gap = PRUNE_GAP * cell
+    out = []
+    for P in strokes:
+        P = np.asarray(P, np.float64)
+        if len(P) == 1:
+            P = np.vstack([P, P])
+        cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(P, axis=0).T))])
+        s = np.append(np.arange(0.0, cum[-1], step), cum[-1])
+        idx = np.clip(np.searchsorted(cum, s, side="right") - 1, 0, len(P) - 2)
+        seg = np.maximum(cum[idx + 1] - cum[idx], 1e-9)
+        q = P[idx] + (P[idx + 1] - P[idx]) * np.clip((s - cum[idx]) / seg, 0, 1)[:, None]
+        x, y = np.round(q[:, 0]).astype(int), np.round(q[:, 1]).astype(int)
+        x0, x1 = np.clip(x - k, 0, W), np.clip(x + k + 1, 0, W)
+        y0, y1 = np.clip(y - k, 0, H), np.clip(y + k + 1, 0, H)
+        good = (I[y1, x1] - I[y0, x1] - I[y1, x0] + I[y0, x0]) >= need
+        if good.all():
+            out.append(P)
+            continue
+        gi = np.flatnonzero(good)
+        if not len(gi):
+            continue
+        a = s[gi[0]]
+        for i, j in zip(gi[:-1], gi[1:]):
+            if s[j] - s[i] > gap:
+                out.append(_cut_polyline(P, cum, a, s[i]))
+                a = s[j]
+        out.append(_cut_polyline(P, cum, a, s[gi[-1]]))
+    return out
+
+
 def _rasterize(strokes, shape):
     """Cells crossed by polylines (horizontal, vertical, or one-cell-per-row diagonals)."""
     P = np.zeros(shape, dtype=bool)
@@ -970,8 +1039,41 @@ def build_plan(img, grid_w, grid_h, ncolors, skip_white, min_blob=3, big_r=0.0, 
         pre_cov = cov.astype(bool).reshape(h, HS, W, px).all(axis=(1, 3))
 
     plan = []
+    # what the canvas shows so far (hi-res, picture area): strokes are trimmed where they would
+    # only repaint pixels that already have their color
+    tgt = np.array(pal + [255] * (768 - len(pal)), dtype=np.uint8).reshape(-1, 3)[L]
+    tgt[white[L]] = 255
+    canvas = np.full_like(tgt, 255)
+    rad_hi = {t: rr * HS for t, rr in tiers}
+    rad_hi.update(fine=HS / 0.9 / 2, tiny=tiny_r * HS, line=line_art_r * HS)
+
+    def cells_to_hi(p):
+        return [((x - ox + 0.5) * HS - 0.5, (y - oy + 0.5) * HS - 0.5) for x, y in p]
+
+    def hi_to_c(P):
+        return [(float(x + 0.5) / HS - 0.5 + ox, float(y + 0.5) / HS - 0.5 + oy) for x, y in P]
+
+    for hx_, rc, strokes in predrawn or []:
+        col = tuple(int(hx_[i:i + 2], 16) for i in (0, 2, 4))
+        if rc <= 0:
+            canvas[:] = col
+        else:
+            _paint_hi(canvas, col, [cells_to_hi(p) for p in strokes], rc * HS)
 
     def add(step):
+        hx_, tag, strokes = step
+        col = tuple(int(hx_[i:i + 2], 16) for i in (0, 2, 4))
+        if tag == "bucket":
+            canvas[:] = col
+        else:
+            r = rad_hi.get(tag) or HS / 0.9 / 2
+            P = [cells_to_hi(p) for p in strokes]
+            if tag != "line":
+                P = _prune_strokes(canvas, tgt, col, P, r, HS)
+                if not P:
+                    return
+                step = (hx_, tag, [hi_to_c(p) for p in P])
+            _paint_hi(canvas, col, P, r)
         plan.append(step)
         if sink is not None:
             sink(step)  # stream: drawing can start before planning finishes
