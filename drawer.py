@@ -879,21 +879,78 @@ def _big_pass(M, T, rb, sx, open_sides=(False, False, False, False)):
     return strokes, covered
 
 
-def build_plan(img, grid_w, grid_h, ncolors, skip_white, min_blob=3, big_r=0.0, denoise=3, tiny_r=0.0,
-               edge_contrast=15.0, merge_de=8.0, min_color_frac=0.002, smooth=0, sink=None,
-               target_only=False, edges_only=False, line_fill=True, line_art_r=0.0, line_contrast=35.0,
-               bucket=False, predrawn=None):
-    """img: PIL Image. Grid cell = fine brush spacing; fill rows are cells, fill columns are
-    SUB sub-cells per cell. big_r / tiny_r = big / tiny brush radius in cells (0 = off).
-    Returns (preview_image, steps); step = (hex, "big"|"fine"|"tiny", strokes),
-    stroke = [(gx, gy), ...] polyline in cell units (may be fractional).
+# ---- picture prep: the part of planning that doesn't depend on the brushes ----
+# (scaled to the grid, line art found, colors reduced and cleaned up). Cached in memory and on
+# disk per picture + grid size + image settings, so the brush search and later rounds reuse it.
 
-    Colors are drawn largest-area first. A color may paint over cells of colors drawn later
-    (they get overwritten), which merges runs. Per color, the big brush fills areas it fits
-    inside, then the fine brush does the rest. Fills never spill onto white (background).
-    Finally the tiny brush redraws a band just inside every color's outline, traced as smooth
-    curves from a high-res target, which fixes the row-stepped edges.
-    """
+PREP_DIR = os.path.join(LIB_DIR, ".prep")
+PREP_MAX_MB = 400
+_PREP_MEM = {}
+
+
+def _prep_key(img, *args):
+    import hashlib
+    return picture_id(img) + "_" + hashlib.md5(repr(args).encode()).hexdigest()[:16]
+
+
+def picture_prep(img, grid_w, grid_h, ncolors, skip_white, min_blob, denoise, merge_de, min_color_frac,
+                 smooth, lines, line_contrast):
+    """(w, h, labels at HS px per cell, palette, line paths, line colors). Cached."""
+    import pickle
+    import zlib
+    args = (grid_w, grid_h, ncolors, bool(skip_white), min_blob, denoise, float(merge_de), min_color_frac,
+            float(smooth), bool(lines), float(line_contrast) if lines else 0.0, HS, 2)
+    key = _prep_key(img, *args)
+    hit = _PREP_MEM.get(key)
+    path = os.path.join(PREP_DIR, key + ".bin")
+    if hit is None:
+        try:
+            with open(path, "rb") as f:
+                w, h, Lz, shape, pal, lp, lc = pickle.loads(f.read())
+            hit = (w, h, np.frombuffer(zlib.decompress(Lz), np.uint8).reshape(shape), pal, lp, lc)
+            os.utime(path)  # recently used: kept when the cache is trimmed
+        except (OSError, EOFError, ValueError, pickle.UnpicklingError, zlib.error):
+            hit = None
+    if hit is None:
+        hit = _picture_prep(img, grid_w, grid_h, ncolors, skip_white, min_blob, denoise, merge_de,
+                            min_color_frac, smooth, lines, line_contrast)
+        try:
+            os.makedirs(PREP_DIR, exist_ok=True)
+            w, h, L, pal, lp, lc = hit
+            tmp = path + f".{os.getpid()}.tmp"
+            with open(tmp, "wb") as f:
+                f.write(pickle.dumps((w, h, zlib.compress(np.ascontiguousarray(L, np.uint8).tobytes(), 3),
+                                      L.shape, pal, lp, lc)))
+            os.replace(tmp, path)
+            _trim_prep()
+        except OSError:
+            pass
+    if len(_PREP_MEM) >= 24:
+        _PREP_MEM.pop(next(iter(_PREP_MEM)))
+    _PREP_MEM[key] = hit
+    w, h, L, pal, lp, lc = hit
+    return w, h, L.copy(), list(pal), lp, lc
+
+
+def _trim_prep():
+    """Keep the disk cache under PREP_MAX_MB (least recently used go first)."""
+    try:
+        fs = [(e.stat().st_mtime, e.stat().st_size, e.path) for e in os.scandir(PREP_DIR) if e.name.endswith(".bin")]
+    except OSError:
+        return
+    total = sum(sz for _, sz, _ in fs)
+    for _, sz, p in sorted(fs):
+        if total <= PREP_MAX_MB * 1e6:
+            break
+        try:
+            os.remove(p)
+            total -= sz
+        except OSError:
+            pass
+
+
+def _picture_prep(img, grid_w, grid_h, ncolors, skip_white, min_blob, denoise, merge_de, min_color_frac,
+                  smooth, lines, line_contrast):
     img = ImageOps.exif_transpose(img).convert("RGBA")
     bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
     bg.alpha_composite(img)
@@ -902,10 +959,9 @@ def build_plan(img, grid_w, grid_h, ncolors, skip_white, min_blob=3, big_r=0.0, 
     scale = min(grid_w / img.width, grid_h / img.height)
     w = max(1, min(grid_w, round(img.width * scale)))
     h = max(1, min(grid_h, round(img.height * scale)))
-    W = w * SUB
     hi = np.asarray(img.resize((w * HS, h * HS), Image.LANCZOS))
     line_paths, line_cols = [], []
-    if line_art_r > 0:  # thin curves: drawn as lines at the end, removed from what gets filled
+    if lines:  # thin curves: drawn as lines at the end, removed from what gets filled
         line_paths, line_cols, lmask = _detect_lines(hi, HS / 0.9, line_contrast)
         if line_paths:  # fill the lines with their surroundings (closing removes thin dark lines,
             # opening thin light ones) - much faster than inpainting, same effect for thin lines
@@ -928,6 +984,30 @@ def build_plan(img, grid_w, grid_h, ncolors, skip_white, min_blob=3, big_r=0.0, 
     L = _majority(L, int(smooth * HS) | 1 if smooth > 0 else 0)
     if min_blob > 1:
         L = _despeckle_cv(L, min_blob * HS * HS // 2)
+    return w, h, L.astype(np.uint8), pal, line_paths, line_cols
+
+
+def build_plan(img, grid_w, grid_h, ncolors, skip_white, min_blob=3, big_r=0.0, denoise=3, tiny_r=0.0,
+               edge_contrast=15.0, merge_de=8.0, min_color_frac=0.002, smooth=0, sink=None,
+               target_only=False, edges_only=False, line_fill=True, line_art_r=0.0, line_contrast=35.0,
+               bucket=False, predrawn=None):
+    """img: PIL Image. Grid cell = fine brush spacing; fill rows are cells, fill columns are
+    SUB sub-cells per cell. big_r / tiny_r = big / tiny brush radius in cells (0 = off).
+    Returns (preview_image, steps); step = (hex, "big"|"fine"|"tiny", strokes),
+    stroke = [(gx, gy), ...] polyline in cell units (may be fractional).
+
+    Colors are drawn largest-area first. A color may paint over cells of colors drawn later
+    (they get overwritten), which merges runs. Per color, the big brush fills areas it fits
+    inside, then the fine brush does the rest. Fills never spill onto white (background).
+    Finally the tiny brush redraws a band just inside every color's outline, traced as smooth
+    curves from a high-res target, which fixes the row-stepped edges.
+    """
+    w, h, L, pal, line_paths, line_cols = picture_prep(
+        img, grid_w, grid_h, ncolors, skip_white, min_blob, denoise, merge_de, min_color_frac, smooth,
+        line_art_r > 0, line_contrast)
+    W = w * SUB
+    npal = len(pal) // 3
+    white = np.array([skip_white and min(pal[3 * i:3 * i + 3]) >= 245 for i in range(npal)] + [False] * (256 - npal))
     bucket_c = None
     if bucket:  # paint bucket: the largest color is filled over the whole canvas in one click,
         # so white is no longer free (it gets painted like any color). Not worth it if the
@@ -3167,6 +3247,34 @@ def sizes_for(fine, d_min, d_max):
     return fine, (big if big >= 3 * fine else None), (d_min if d_min <= TINY_MAX_RATIO * fine else None)
 
 
+def prep_configs(cfg):
+    """One config per distinct drawing grid the brush search can try (every fine-brush
+    candidate on this canvas), for preparing pictures ahead of time."""
+    curve = cfg.get("brush_curve")
+    if curve and len(curve) >= 2:
+        d_min, d_max = curve_range(cfg, sorted(curve))
+        fines = [f for f in FINE_CANDIDATES if d_min <= f <= d_max] or [round(min(max(d_min, 3.0), d_max), 1)]
+        cands = [cfg_with_sizes(cfg, None, *sizes_for(f, d_min, d_max)) for f in fines]
+    else:
+        cands = [cfg]
+    out, seen = [], set()
+    for c in cands:
+        a = plan_args(Image.new("RGB", (1, 1)), c)
+        if (a[1], a[2]) not in seen:
+            seen.add((a[1], a[2]))
+            out.append(c)
+    return out
+
+
+def _prep_job(path, cfg):
+    """Prepare one picture for one grid (worker process)."""
+    img = Image.open(path)
+    img.load()
+    a, kw = plan_args(img, cfg), plan_kw(cfg)
+    picture_prep(img, a[1], a[2], a[3], a[4], a[5], a[7], a[10], a[11], a[12],
+                 kw["line_art_r"] > 0, kw["line_contrast"])
+
+
 def _estimate_job(img, cfg, sizes):
     """(sizes, plan, est) for one brush set; runs in a worker process."""
     plan, est = plan_for(img, cfg_with_sizes(cfg, None, *sizes))
@@ -4107,6 +4215,7 @@ class App(QWidget):
         self.lib_planning = set()
         self.lib_scores, self.lib_scoring = self.lib_load_scores(), set()
         self.lib_refresh()
+        QTimer.singleShot(3000, self.lib_prep)  # prepare the library for planning, in the background
 
         # --- Calibrate tab: click each point in Roblox
         cal = QWidget()
@@ -4699,6 +4808,42 @@ class App(QWidget):
         if not self.lib_scoring:
             self.set_status_main("Library scored")
         self.lib_refresh()
+        self.lib_prep([p])
+
+    def lib_prep(self, paths=None):
+        """In the background, do the brush-independent part of planning (scaling, colors, line
+        art) for library pictures on every grid the brush search may use, so planning at Start
+        skips it. Pauses while drawing; one picture/grid at a time to leave the CPU free."""
+        if not hasattr(self, "_prep_todo"):
+            self._prep_todo, self._prep_running = [], False
+        for p in (paths if paths is not None else self.lib_files()):
+            if p not in self._prep_todo:
+                self._prep_todo.append(p)
+        if self._prep_running or not self._prep_todo:
+            return
+        try:
+            self.read_settings()
+            self.plan_checks()
+        except Exception:
+            return  # not calibrated yet: nothing to prepare for
+        cfg = dict(self.cfg)
+        self._prep_running = True
+
+        def work():
+            try:
+                cfgs = prep_configs(cfg)
+                while self._prep_todo:
+                    p = self._prep_todo.pop(0)
+                    for c in cfgs:
+                        while self.drawing:
+                            time.sleep(1.0)
+                        try:
+                            pool().submit(_prep_job, p, c).result()
+                        except Exception:
+                            break  # unreadable picture: skip it
+            finally:
+                self._prep_running = False
+        threading.Thread(target=work, daemon=True).start()
 
     def load_image(self):
         path, _ = QFileDialog.getOpenFileName(
