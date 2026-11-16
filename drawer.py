@@ -899,7 +899,7 @@ def picture_prep(img, grid_w, grid_h, ncolors, skip_white, min_blob, denoise, me
     import pickle
     import zlib
     args = (grid_w, grid_h, ncolors, bool(skip_white), min_blob, denoise, float(merge_de), min_color_frac,
-            float(smooth), bool(lines), float(line_contrast) if lines else 0.0, HS, 2)
+            float(smooth), bool(lines), float(line_contrast) if lines else 0.0, HS, 3)
     key = _prep_key(img, *args)
     hit = _PREP_MEM.get(key)
     path = os.path.join(PREP_DIR, key + ".bin")
@@ -949,6 +949,44 @@ def _trim_prep():
             pass
 
 
+def _small_features(hi, contrast=60, max_frac=0.006):
+    """Mask of small, compact, clearly darker spots (eyes, pupils, nostrils, mouths),
+    from ~half a cell to ~4 cells across: smoothing and despeckling would erase them, and faces
+    look wrong without them. Long bands and shading are left alone; a bigger contrasting area
+    is searched again at higher contrast for the spots inside it. Grain/texture (lots of such
+    spots) is left to the denoising: the most contrasting spots are kept up to max_frac of the
+    picture. None if there are none."""
+    g = cv2.cvtColor(np.ascontiguousarray(hi), cv2.COLOR_RGB2GRAY).astype(np.float32)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(3 * HS) | 1, int(3 * HS) | 1))
+    # dark spots only: eyes, pupils, nostrils, mouths. (Light specks are mostly glare, foam
+    # and texture: keeping them costs a lot of strokes for little.)
+    score = cv2.morphologyEx(g, cv2.MORPH_BLACKHAT, k)
+    min_area, max_side = (0.7 * HS) ** 2, 4 * HS
+    taken = np.zeros(g.shape, bool)
+    spots = []  # (peak contrast, area, slices, mask)
+    for thr in (contrast, 1.5 * contrast, 2.2 * contrast):
+        m = ((score > thr) & ~taken).astype(np.uint8)
+        n, comp, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+        for i in range(1, n):
+            x, y, bw, bh, area = stats[i]
+            if area < min_area or bw > max_side or bh > max_side or area < 0.25 * bw * bh:
+                continue  # too small to draw, a long band, or a thin curve (line art's job)
+            sl = (slice(y, y + bh), slice(x, x + bw))
+            sm = comp[sl] == i
+            spots.append((float(score[sl][sm].max()), int(area), sl, sm))
+            taken[sl] |= sm
+    if not spots:
+        return None
+    keep = np.zeros(g.shape, bool)
+    budget, used = max_frac * g.size, 0
+    for peak, area, sl, sm in sorted(spots, key=lambda t: -t[0]):
+        if used + area > budget:
+            break
+        used += area
+        keep[sl] |= sm
+    return keep if used else None
+
+
 def _picture_prep(img, grid_w, grid_h, ncolors, skip_white, min_blob, denoise, merge_de, min_color_frac,
                   smooth, lines, line_contrast):
     img = ImageOps.exif_transpose(img).convert("RGBA")
@@ -974,8 +1012,11 @@ def _picture_prep(img, grid_w, grid_h, ncolors, skip_white, min_blob, denoise, m
             g = src.mean(2)
             fill = np.where((closed.mean(2) - g > g - opened.mean(2))[..., None], closed, opened)
             hi = np.where(hole[..., None], fill, src).astype(np.uint8)
+    spots = _small_features(hi)  # eyes, pupils, nostrils: put back after smoothing/despeckling
+    raw = hi
     if denoise >= 3:  # median filter: removes grain/texture specks, keeps edges and lines
         hi = cv2.medianBlur(np.ascontiguousarray(hi), min(15, (denoise * HS // 2) | 1))
+    # palette from the denoised picture; the kept spots then take their nearest palette color
     _, pal = quantize_lab(Image.fromarray(cv2.resize(hi, (w * 2, h * 2), interpolation=cv2.INTER_AREA)), ncolors)
     L = _assign_lab(hi, pal).reshape(h * HS, w * HS)
     npal = len(pal) // 3
@@ -984,6 +1025,18 @@ def _picture_prep(img, grid_w, grid_h, ncolors, skip_white, min_blob, denoise, m
     L = _majority(L, int(smooth * HS) | 1 if smooth > 0 else 0)
     if min_blob > 1:
         L = _despeckle_cv(L, min_blob * HS * HS // 2)
+    if spots is not None:  # each spot as one solid blob of its own (median) color
+        used = np.unique(L)
+        P = np.array(pal, np.uint8).reshape(-1, 3)[used]
+        n, comp = cv2.connectedComponents(spots.astype(np.uint8), connectivity=8)
+        for i in range(1, n):
+            sm = comp == i
+            px_ = raw[sm].reshape(-1, 3)
+            gray = px_.mean(1)
+            col = np.median(px_[gray <= np.median(gray)], axis=0)  # the spot's dark core
+            j = used[_assign_lab(col[None, None].astype(np.uint8), P.reshape(-1).tolist())[0]]
+            if j != np.bincount(L[sm]).argmax():  # visibly different from what's there now
+                L[sm] = j
     return w, h, L.astype(np.uint8), pal, line_paths, line_cols
 
 
