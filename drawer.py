@@ -153,6 +153,28 @@ def _post(kind, x, y):
     _LAST_POST[0] = time.perf_counter()
 
 
+def focus_roblox(spot):
+    """Bring the Roblox window to the front and click a safe spot in it (so the game takes
+    the following mouse input) - replaces the 5s countdown."""
+    try:
+        from AppKit import NSWorkspace, NSApplicationActivateIgnoringOtherApps
+        apps = [a for a in NSWorkspace.sharedWorkspace().runningApplications()
+                if (a.localizedName() or "") == "Roblox"
+                or (a.bundleIdentifier() or "").startswith("com.roblox.RobloxPlayer")]
+        if apps:
+            apps[0].activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+            time.sleep(0.2)
+    except Exception:
+        pass
+    x, y = spot
+    _post(Quartz.kCGEventMouseMoved, x, y)
+    time.sleep(0.05)
+    _post(Quartz.kCGEventLeftMouseDown, x, y)
+    time.sleep(0.05)
+    _post(Quartz.kCGEventLeftMouseUp, x, y)
+    time.sleep(0.25)
+
+
 # ---------- image -> drawing plan ----------
 
 def _to_lab(rgb):
@@ -1656,12 +1678,12 @@ class Drawer:
         self.status = status
         raw_progress = progress or (lambda stage, frac, text="", hx="": None)
         raw_status = status
-        last = {"p": 0.0, "s": 0.0}
+        last = {"p": {}, "s": 0.0}
 
         def progress_throttled(stage, frac, text="", hx=""):
-            now = time.perf_counter()  # at most ~7 updates/s (window repaints compete with drawing)
-            if frac < 0 or frac >= 1.0 or now - last["p"] > 0.15:
-                last["p"] = now
+            now = time.perf_counter()  # at most ~5 updates/s per bar (repaints compete with drawing)
+            if frac < 0 or frac >= 1.0 or now - last["p"].get(stage, 0.0) > 0.2:
+                last["p"][stage] = now
                 raw_progress(stage, frac, text, hx)
 
         def status_throttled(msg):
@@ -1969,7 +1991,17 @@ class Drawer:
     def _report(self, stage, done_s, totals, text, hx):
         a, span = self.stage_span
         frac = done_s / totals[stage] if totals.get(stage) else 0.0
+        if totals.get(stage) and not self._stage_override:
+            left = max(0.0, totals[stage] - done_s) * getattr(self, "_speed", 1.0)
+            text = f"{frac:.0%} \u00b7 ~{left:.0f}s \u00b7 {text}"
         self.progress(stage, a + span * min(1.0, frac), text, hx)
+        ov = getattr(self, "_ov", None)
+        if ov and not self._stage_override:  # whole drawing: time spent, time left, round end
+            t0, rem0 = ov
+            rem = max(0.0, rem0 - (time.perf_counter() - t0))
+            el = time.time() - self._run_t0
+            dl = self.deadline - time.time() if self.deadline else -1.0
+            self.progress("overall", el / max(1e-6, el + rem), f"{rem:.1f}|{dl:.1f}|{el:.1f}", "")
 
     def _run(self, plan, cx0, cy0, s, total, costs, skip_tiny, note):
         done = 0
@@ -1980,6 +2012,7 @@ class Drawer:
         pct = brush_pcts(self.cfg)
         cur_color, cur_size = None, None
         start = time.time()
+        self._run_t0, self._ov = start, None
         spent_est = 0.0
         seq = list(plan) if isinstance(plan, list) else None  # a list can be re-planned mid-drawing
         it = None if seq is not None else iter(plan)
@@ -2036,6 +2069,7 @@ class Drawer:
                 if not pend.ready.is_set():
                     self.status("Background done; waiting for the plan to finish...")
                     self.progress("plan", -1, "finishing the plan...", "")
+                    self.progress("overall", -1, "waiting for the plan to finish", "")
                 while not pend.ready.wait(0.1):
                     self.check()
                 start += time.time() - w0  # waiting isn't slow drawing
@@ -2145,6 +2179,7 @@ class Drawer:
                     else:
                         note = ""
                 remaining = (rem_ticks * (self.frame + TICK_OVERHEAD) + rem_fixed) * speed
+                self._speed = speed
                 if remaining > left and self.frame <= self.min_frame + 1e-6:
                     note = " | running late even at full speed: edges will be cut short"
                 t_i, h_i, f_i = parts[ci - 1]
@@ -2155,13 +2190,15 @@ class Drawer:
             stage = self._stage_override or STAGE_OF[size]
             totals = self._stage_totals(plan, cache)
             step_s = cache[ci - 1] if ci - 1 < len(cache) else 0.0
+            rem0 = remaining if costs else sum(totals.values()) - sum(done_s.values())
+            self._ov = (time.perf_counter(), max(0.0, rem0))
             if stream is not None and stream.complete:
                 self.progress("plan", 1.0, "done", "")
             if skip_tiny and size == "tiny":
                 self.progress("edges", -2, "skipped: running late", "")
                 continue
-            label = f"{size} brush"
-            self._report(stage, done_s.get(stage, 0.0), totals, f"#{hexstr} {label}", hexstr)
+            label = size
+            self._report(stage, done_s.get(stage, 0.0), totals, label, hexstr)
             step_t0 = time.perf_counter()
             step_comp = step_components(self.cfg, (hexstr, size, strokes), getattr(self, "_prev_step", None))
             step_pred = sum(step_comp)
@@ -2189,7 +2226,7 @@ class Drawer:
                     late_check(step_pred0 + step_cost_now * si / len(strokes))
                 done_s[stage] = done_s.get(stage, 0.0) + per_stroke
                 if si % 3 == 0 or si == len(strokes):
-                    self._report(stage, done_s[stage], totals, f"#{hexstr} {label} - stroke {si}/{len(strokes)}", hexstr)
+                    self._report(stage, done_s[stage], totals, f"{label} {si}/{len(strokes)}", hexstr)
                 if done % 10 == 0:
                     self.status(f"Step {ci} #{hexstr} ({size}) - {done}" + (f"/{total}" if total else "")
                                 + " strokes" + note_t + note)
@@ -2996,6 +3033,53 @@ def _estimate_job(img, cfg, sizes):
     return sizes, plan, est
 
 
+class PlanMeter:
+    """How far the planning search has got: candidate plans finished out of expected. Phases
+    announce how many plans they'll make; the bar reads done / max(expected, guess)."""
+    def __init__(self):
+        self.reset()
+
+    def reset(self, guess=0):
+        self.done, self.expected, self.guess, self.t0 = 0, 0, guess, time.time()
+
+    def expect(self, n):
+        self.expected += n
+        return self.done + n  # the count this phase ends at
+
+    def tick(self, n=1):
+        self.done += n
+
+    def settle(self, end):  # a phase finished early (cancelled the rest)
+        if self.done < end:
+            self.done = end
+
+    def frac(self):
+        tot = max(self.expected, self.guess, 1)
+        return min(0.99, self.done / tot)
+
+    def text(self):
+        tot = max(self.expected, self.guess)
+        if not tot:
+            return ""
+        f, el = self.frac(), time.time() - self.t0
+        eta = f" - ~{el * (1 - f) / f:.0f}s left" if f > 0.05 and el > 1 else ""
+        return f"{min(self.done, tot)}/{tot} plans{eta}"
+
+
+PLAN_METER = PlanMeter()
+
+
+def search_guess(cfg, tune):
+    """Rough number of plans the Start search makes (for the planning bar)."""
+    curve = cfg.get("brush_curve")
+    n = 2
+    if curve and len(curve) >= 2:
+        d0, d1 = curve_range(cfg, sorted(curve))
+        lo, hi = max(3.0, d0), max(3.0, min(d1, 30))
+        n += len([f for f in FINE_CANDIDATES if lo <= f <= hi]) + 1
+    return n + (19 if tune else 4)
+
+
 def prefetch_estimates(img, cfg, d_min, d_max):
     """Start planning every candidate fine size in the background (guessed tiny/big sizes),
     coarsest (fastest) first. Returns {fine: future -> (sizes, plan, est)}."""
@@ -3033,13 +3117,18 @@ def upgrade_detail(img, cfg, plan, est, budget, emit=lambda m: None, futs=None):
     levels = detail_levels(cfg)
     emit(f"Plan needs ~{est:.0f}s of {budget:.0f}s: trying {len(levels)} more detailed versions...")
     futs = futs or [(desc, dict(cfg, **chg), pool().submit(_plan_job, img, dict(cfg, **chg))) for desc, chg in levels]
-    for n, (desc, c, f) in enumerate(reversed(futs)):  # most detailed first: stop at the first that fits
-        p, e = f.result()
-        if e <= budget:
-            for _, _, other in futs[:len(futs) - 1 - n]:
-                other.cancel()
-            return c, p, e, desc
-    return cfg, plan, est, None
+    end = PLAN_METER.expect(len(futs))
+    try:
+        for n, (desc, c, f) in enumerate(reversed(futs)):  # most detailed first: stop at the first that fits
+            p, e = f.result()
+            PLAN_METER.tick()
+            if e <= budget:
+                for _, _, other in futs[:len(futs) - 1 - n]:
+                    other.cancel()
+                return c, p, e, desc
+        return cfg, plan, est, None
+    finally:
+        PLAN_METER.settle(end)
 
 
 def choose_sizes(img, cfg, curve, budget, emit=lambda m: None, prefetched=None):
@@ -3063,6 +3152,7 @@ def choose_sizes(img, cfg, curve, budget, emit=lambda m: None, prefetched=None):
         if f not in futs:
             futs[f] = pool().submit(_estimate_job, img, cfg, sizes_for(f, d_min, d_max))
     emit(f"Planning {len(cands)} brush sizes in parallel...")
+    end = PLAN_METER.expect(len(cands) + 1)
     # time only grows as the brush shrinks: once a size is over budget, finer ones are skipped
     results, too_slow = {}, 0.0
     waiting = {futs[f]: f for f in cands}
@@ -3071,12 +3161,14 @@ def choose_sizes(img, cfg, curve, budget, emit=lambda m: None, prefetched=None):
         for fut in done:
             f = waiting.pop(fut)
             results[f] = fut.result()
+            PLAN_METER.tick()
             if results[f][2] > budget:
                 too_slow = max(too_slow, f)
         for fut, f in list(waiting.items()):
             if f < too_slow:  # finer than a size that's already too slow
                 fut.cancel()
                 waiting.pop(fut)
+                PLAN_METER.tick()
     for f in [g for g in futs if g not in cands or g < too_slow]:
         futs[f].cancel()
     fits = sorted(f for f, r in results.items() if r[2] <= budget)
@@ -3091,7 +3183,8 @@ def choose_sizes(img, cfg, curve, budget, emit=lambda m: None, prefetched=None):
             plan, e = plan_for(img, c)
         emit(f"Planning: fine brush {f:.1f}pt -> ~{e:.0f}s")
         if e <= budget:
-            return c, plan, e, sz
+            break
+    PLAN_METER.settle(end)
     return c, plan, e, sz
 
 
@@ -3211,6 +3304,7 @@ def auto_tune(img, cfg, budget, emit=lambda m: None):
               for n in (12, 20, 28) for sm in (0.5, 1.0, 1.5) for la in (True, False)]
     emit(f"Auto-tune: trying {len(combos)} setting combinations...")
     futs = [(cc, pool().submit(_quality_job, img, cc)) for cc in combos]
+    end = PLAN_METER.expect(len(futs) + 1)
     scored = []
     for cc, f in futs:
         try:
@@ -3218,9 +3312,11 @@ def auto_tune(img, cfg, budget, emit=lambda m: None):
             scored.append((err, est, cc))
         except Exception:
             pass
+        PLAN_METER.tick()
     fits = [t for t in scored if t[1] <= budget]
     err, est, best = min(fits, key=lambda t: t[0]) if fits else min(scored, key=lambda t: t[1])
     plan, est = plan_for(img, best)
+    PLAN_METER.settle(end)
     if est > budget:  # nothing fit: simplify the best-looking pick until it does
         emit("Auto-tune: no combination fits the time, simplifying...")
         best, plan, est, d = fit_to_time(img, best, budget, emit)
@@ -3270,7 +3366,9 @@ def _fit_to_time(img, cfg, budget, emit=lambda m: None):
              ("half the colors", {"tiny_brush_pct": 0, "colors": max(4, int(cfg["colors"] * 0.5))})]
     for desc, change in steps[1:] if prefix else steps:
         c = dict(cfg, **change)
+        PLAN_METER.expect(1)
         plan, est = plan_for(img, c)
+        PLAN_METER.tick()
         emit(f"Planning ({desc}): ~{est:.0f}s")
         if est <= budget:
             if not change:  # current settings fit: use spare time for more detail
@@ -3282,38 +3380,84 @@ def _fit_to_time(img, cfg, budget, emit=lambda m: None):
 
 # ---------- GUI (Qt) ----------
 
+def _mmss(sec):
+    sec = max(0, int(round(sec)))
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
 class ProgressPanel(QWidget):
-    """One bar per stage, top to bottom. Finished stages fill green, the current one is
-    highlighted (with a swatch of the color being drawn), skipped ones go gray."""
+    """Overall bar (time spent, time left, round end) above one bar per stage. Finished stages
+    fill green, the current one is highlighted (with a swatch of the color being drawn),
+    skipped ones go gray. The time left counts down between updates."""
     STAGES = [("plan", "Planning"), ("countdown", "Countdown"), ("fill", "Filling colors"),
-              ("edges", "Sharpening edges"), ("lines", "Line art"), ("correct", "Screenshot correction")]
-    STYLE = {"wait": "#c8c8c8", "cur": "#3b82f6", "busy": "#60a5fa", "done": "#22a35a", "skip": "#9a9a9a",
-             "stop": "#d97706"}
+              ("edges", "Sharpening edges"), ("lines", "Line art"), ("correct", "Correcting")]
+    STYLE = {"wait": "#d4d4d4", "cur": "#3b82f6", "busy": "#60a5fa", "done": "#22a35a", "skip": "#a3a3a3",
+             "stop": "#d97706", "late": "#dc2626"}
+
+    @staticmethod
+    def _bar_css(color, h):
+        return (f"QProgressBar {{ border: none; border-radius: {h // 2}px; background: #e5e7eb; "
+                f"color: #111; font-size: 11px; font-weight: 600; }}"
+                f"QProgressBar::chunk {{ background: {color}; border-radius: {h // 2}px; }}")
 
     def __init__(self):
         super().__init__()
-        grid = QGridLayout(self)
-        grid.setContentsMargins(0, 0, 0, 0)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 4, 0, 4)
+        v.setSpacing(4)
+        head = QHBoxLayout()
+        self.ov_title = QLabel("Drawing")
+        f = self.ov_title.font()
+        f.setBold(True)
+        f.setPointSize(f.pointSize() + 1)
+        self.ov_title.setFont(f)
+        head.addWidget(self.ov_title)
+        head.addStretch(1)
+        self.ov_left = QLabel("")
+        self.ov_left.setFont(f)
+        head.addWidget(self.ov_left)
+        v.addLayout(head)
+        self.ov_bar = QProgressBar()
+        self.ov_bar.setRange(0, 1000)
+        self.ov_bar.setFixedHeight(20)
+        self.ov_bar.setFormat("%p%")
+        self.ov_bar.setAlignment(Qt.AlignCenter)
+        self.ov_bar.setStyleSheet(self._bar_css(self.STYLE["cur"], 20))
+        v.addWidget(self.ov_bar)
+        self.ov_info = QLabel("")
+        self.ov_info.setStyleSheet("color: #555; font-size: 11px;")
+        v.addWidget(self.ov_info)
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 2, 0, 0)
         grid.setVerticalSpacing(3)
+        grid.setHorizontalSpacing(6)
         self.rows, self.order, self.state = {}, [k for k, _ in self.STAGES], {}
         for r, (key, name) in enumerate(self.STAGES):
             lbl = QLabel(name)
+            lbl.setMinimumWidth(lbl.fontMetrics().horizontalAdvance("\u25b6 Sharpening edges") + 8)
             bar = QProgressBar()
             bar.setRange(0, 1000)
-            bar.setFixedHeight(14)
+            bar.setFixedHeight(10)
+            bar.setMinimumWidth(90)
             bar.setTextVisible(False)
             sw = QLabel()
             sw.setFixedSize(12, 12)
             info = QLabel("")
             info.setStyleSheet("color: #666; font-size: 11px;")
-            info.setMinimumWidth(150)
+            info.setFixedWidth(190)
             grid.addWidget(lbl, r, 0)
             grid.addWidget(bar, r, 1)
             grid.addWidget(sw, r, 2)
             grid.addWidget(info, r, 3)
             self.rows[key] = (lbl, bar, sw, info)
         grid.setColumnStretch(1, 1)
+        v.addLayout(grid)
+        self.ov = None  # (time of update, seconds left, seconds to round end, seconds spent)
+        self.t_start = None
+        self.tick = QTimer(self)
+        self.tick.timeout.connect(self._tick)
         self.begin(())
+        self.setVisible(False)
 
     def _paint(self, key, state):
         lbl, bar, sw, info = self.rows[key]
@@ -3321,16 +3465,19 @@ class ProgressPanel(QWidget):
             return  # restyling is expensive; skip when unchanged
         bar._styled = state
         self.state[key] = state
-        bar.setStyleSheet(f"QProgressBar {{ border: 1px solid #bbb; border-radius: 3px; background: #f2f2f2; }}"
-                          f"QProgressBar::chunk {{ background: {self.STYLE[state]}; border-radius: 2px; }}")
-        lbl.setText(("\u25b6 " if state == "cur" else "") + dict(self.STAGES)[key])
+        bar.setStyleSheet(self._bar_css(self.STYLE[state], 10))
+        lbl.setText(("▶ " if state in ("cur", "busy") else "✓ " if state == "done" else "")
+                    + dict(self.STAGES)[key])
+        lbl.setStyleSheet("color: #888;" if state in ("skip", "wait") else "")
         f = lbl.font()
-        f.setBold(state == "cur")
+        f.setBold(state in ("cur", "busy"))
         lbl.setFont(f)
         if state != "cur":
             sw.setStyleSheet("")
+            sw._hx = None
 
     def begin(self, stages):
+        self.setVisible(bool(stages))
         for key in self.order:
             vis = key in stages
             for wdg in self.rows[key]:
@@ -3340,13 +3487,65 @@ class ProgressPanel(QWidget):
             bar.setValue(0)
             info.setText("waiting" if vis else "")
             self._paint(key, "wait")
+        self.ov, self.t_start, self.wait_txt = None, time.time(), ""
+        self.ov_title.setText("Getting ready")
+        self.ov_left.setText("")
+        self.ov_bar.setRange(0, 1000)
+        self.ov_bar.setValue(0)
+        self.ov_bar.setStyleSheet(self._bar_css(self.STYLE["cur"], 20))
+        self.ov_info.setText("")
+        if stages:
+            self.tick.start(500)
+
+    def _tick(self):
+        """Count down between drawer updates so the time left never looks frozen."""
+        if self.ov is None:
+            if self.t_start:
+                since = f"{_mmss(time.time() - self.t_start)} since Start"
+                self.ov_info.setText(f"{self.wait_txt}  \u00b7  {since}" if self.wait_txt else since)
+            return
+        t, rem, dl, el = self.ov
+        now = time.time() - t
+        rem, el = max(0.0, rem - now), el + now
+        self.ov_left.setText(f"~{_mmss(rem)} left")
+        parts = [f"{_mmss(el)} drawing"]
+        if dl >= 0:
+            dl = max(0.0, dl - now)
+            parts.append(f"round ends in {_mmss(dl)}")
+            spare = dl - rem
+            parts.append(f"{spare:.0f}s to spare" if spare >= 0 else f"{-spare:.0f}s short: simplifying")
+            late = spare < 0
+            if getattr(self.ov_bar, "_late", None) != late:
+                self.ov_bar._late = late
+                self.ov_bar.setStyleSheet(self._bar_css(self.STYLE["late" if late else "cur"], 20))
+        self.ov_info.setText("  ·  ".join(parts))
 
     def update_stage(self, key, frac, text, hx):
         if key == "end":
             return self.finish(text)
+        if key == "overall":
+            if frac < 0:
+                self.ov = None
+                self.ov_left.setText("")
+                self.ov_title.setText("Waiting for the plan")
+                self.wait_txt = text
+                return self._tick()
+            rem, dl, el = (float(x) for x in text.split("|"))
+            self.ov = (time.time(), rem, dl, el)
+            self.ov_title.setText("Drawing")
+            self.ov_bar.setValue(int(min(1.0, frac) * 1000))
+            return self._tick()
         if key not in self.rows or not self.rows[key][1].isVisible():
             return
         lbl, bar, sw, info = self.rows[key]
+        if key == "plan" and 0 <= frac < 1 and self.state.get("plan") == "done":
+            return  # a late meter tick after planning finished
+        if key == "plan" and self.ov is None and 0 <= frac < 1:
+            if self.ov_title.text() != "Waiting for the plan":
+                self.ov_title.setText("Planning")
+            self.ov_bar.setValue(int(frac * 1000))
+            self.wait_txt = f"planning {text}" if text else ""
+            self.ov_left.setText(text.split("~")[-1].replace(" left", "") + " left" if "~" in text else "")
         if frac == -2:  # skipped
             bar.setRange(0, 1000)
             bar.setValue(1000)
@@ -3354,9 +3553,9 @@ class ProgressPanel(QWidget):
             return self._paint(key, "skip")
         # everything above the current stage is finished (background work like planning
         # keeps running until it reports in)
-        if frac >= 0:
+        if frac >= 0 and key != "plan":
             for k in self.order[:self.order.index(key)]:
-                if self.state.get(k) in ("wait", "cur") and self.rows[k][1].isVisible():
+                if k != "plan" and self.state.get(k) in ("wait", "cur") and self.rows[k][1].isVisible():
                     b = self.rows[k][1]
                     b.setRange(0, 1000)
                     b.setValue(1000)
@@ -3380,6 +3579,19 @@ class ProgressPanel(QWidget):
             sw.setStyleSheet(f"background: #{hx}; border: 1px solid #555; border-radius: 2px;")
 
     def finish(self, reason):
+        self.tick.stop()
+        took = _mmss(time.time() - self.t_start) if self.t_start else ""
+        self.ov = None
+        self.ov_left.setText("")
+        if reason == "done":
+            self.ov_title.setText("Done")
+            self.ov_bar.setValue(1000)
+            self.ov_bar.setStyleSheet(self._bar_css(self.STYLE["done"], 20))
+            self.ov_info.setText(f"finished in {took}")
+        else:
+            self.ov_title.setText("Stopped")
+            self.ov_bar.setStyleSheet(self._bar_css(self.STYLE["stop"], 20))
+            self.ov_info.setText(f"{reason} after {took}")
         for key in self.order:
             if not self.rows[key][1].isVisible() or self.state.get(key) in ("done", "skip"):
                 continue
@@ -3405,6 +3617,104 @@ class Bridge(QObject):
     settings_done = Signal(dict)
     progress = Signal(str, float, str, str)
     auto_done = Signal(dict)
+    preview_done = Signal(int, object)
+
+
+class ClickCatcher(QObject):
+    """Waits for the next mouse click outside our window and reports where it was. The click
+    is swallowed (an event tap; needs Accessibility) so it doesn't draw on the canvas or press
+    game buttons; Esc is reported as `skipped`. Without the tap it falls back to watching the
+    mouse button (the click then also reaches the game)."""
+    clicked = Signal(float, float)
+    skipped = Signal()
+
+    def __init__(self, own_rect):
+        super().__init__()
+        self.own_rect = own_rect  # () -> (x, y, w, h) of our window, clicks there are ignored
+        self.active, self._loop, self._swallow_up = False, None, False
+        self._poll = QTimer(self)
+        self._poll.timeout.connect(self._poll_tick)
+
+    def _inside_own(self, x, y):
+        rx, ry, rw, rh = self._rect
+        return rx <= x < rx + rw and ry <= y < ry + rh
+
+    def start(self):
+        self._rect = self.own_rect()
+        if self.active:
+            return
+        self.active = True
+        ok = threading.Event()
+        self._tap_ok = False
+        threading.Thread(target=self._tap_thread, args=(ok,), daemon=True).start()
+        ok.wait(1.0)
+        if not self._tap_ok:  # no event tap: poll the button (the click goes through)
+            self._was_down = True
+            self._esc_was = True
+            self._poll.start(15)
+
+    def stop(self):
+        self.active = False
+        self._poll.stop()
+        if self._loop is not None:
+            Quartz.CFRunLoopStop(self._loop)
+            self._loop = None
+
+    def _poll_tick(self):
+        down = bool(Quartz.CGEventSourceButtonState(Quartz.kCGEventSourceStateCombinedSessionState,
+                                                    Quartz.kCGMouseButtonLeft))
+        esc = stop_key_down()
+        if down and not self._was_down:
+            x, y = mouse_pos()
+            if not self._inside_own(x, y):
+                self.clicked.emit(x, y)
+        if esc and not self._esc_was:
+            self.skipped.emit()
+        self._was_down, self._esc_was = down, esc
+
+    def _tap_thread(self, ok):
+        Q = Quartz
+        mask = (Q.CGEventMaskBit(Q.kCGEventLeftMouseDown) | Q.CGEventMaskBit(Q.kCGEventLeftMouseUp)
+                | Q.CGEventMaskBit(Q.kCGEventKeyDown))
+        holder = {}
+
+        def cb(proxy, etype, event, refcon):
+            if etype in (Q.kCGEventTapDisabledByTimeout, Q.kCGEventTapDisabledByUserInput):
+                if holder.get("tap") is not None:
+                    Q.CGEventTapEnable(holder["tap"], True)
+                return event
+            if not self.active:
+                return event
+            if etype == Q.kCGEventLeftMouseDown:
+                x, y = Q.CGEventGetLocation(event)
+                if self._inside_own(x, y):
+                    return event
+                self._swallow_up = True
+                self.clicked.emit(float(x), float(y))
+                return None
+            if etype == Q.kCGEventLeftMouseUp and self._swallow_up:
+                self._swallow_up = False
+                return None
+            if etype == Q.kCGEventKeyDown and \
+                    Q.CGEventGetIntegerValueField(event, Q.kCGKeyboardEventKeycode) == ESC_KEYCODE:
+                self.skipped.emit()
+                return None
+            return event
+
+        tap = Q.CGEventTapCreate(Q.kCGSessionEventTap, Q.kCGHeadInsertEventTap, Q.kCGEventTapOptionDefault,
+                                 mask, cb, None)
+        if tap is None:
+            ok.set()
+            return
+        holder["tap"] = tap
+        src = Q.CFMachPortCreateRunLoopSource(None, tap, 0)
+        self._loop = Q.CFRunLoopGetCurrent()
+        Q.CFRunLoopAddSource(self._loop, src, Q.kCFRunLoopCommonModes)
+        Q.CGEventTapEnable(tap, True)
+        self._tap_ok = True
+        ok.set()
+        Q.CFRunLoopRun()
+        Q.CGEventTapEnable(tap, False)
 
 
 class App(QWidget):
@@ -3426,7 +3736,8 @@ class App(QWidget):
            ("bucket_tool", "Paint bucket tool (optional)", "all"),
            ("brush_tool", "Brush / pen tool (optional, with bucket)", "all"),
            ("brush_dec", "Brush size - arrow (optional)", "all"),
-           ("brush_inc", "Brush size + arrow (optional)", "all")]
+           ("brush_inc", "Brush size + arrow (optional)", "all"),
+           ("focus_spot", "Safe spot in the Roblox window (optional: skips the 5s countdown)", "all")]
     FIELDS = [("spacing", "Line spacing (pt) - use Measure brush", float),
               ("brush_pct", "Fine brush slider position (0-100)", float),
               ("big_brush_pct", "Big brush slider position (0 = off)", float),
@@ -3470,6 +3781,10 @@ class App(QWidget):
         self.bridge.measured.connect(self.apply_brush)
         self.bridge.progress.connect(lambda k, f, t, h: self.progress_panel.update_stage(k, f, t, h))
         self.bridge.auto_done.connect(self.apply_auto_brush)
+        self.bridge.preview_done.connect(self.show_preview)
+        self._preview_gen, self._pv_done = 0, 0
+        self._pv_timer = QTimer(self)
+        self._pv_timer.timeout.connect(self._preview_tick)
         self.bridge.speed_done.connect(self.apply_auto_speed)
         self.bridge.color_done.connect(self.apply_color_check)
         self.bridge.timing.connect(self.learn_timing)
@@ -3478,88 +3793,147 @@ class App(QWidget):
         self.setWindowTitle("Roblox Drawer")
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         root = QVBoxLayout(self)
+        root.setSpacing(6)
         tabs = QTabWidget()
         root.addWidget(tabs, 1)
 
-        # --- Draw tab: image source, preview, test buttons
+        def hint(text):
+            lbl = QLabel(text)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("color: #666; font-size: 11px;")
+            return lbl
+
+        # --- Draw tab: picture + preview
         draw = QWidget()
         dl = QVBoxLayout(draw)
         row = QHBoxLayout()
-        btn = QPushButton("Use clipboard")
+        btn = QPushButton("Paste image")
+        btn.setToolTip("Use the image on the clipboard")
         btn.clicked.connect(self.use_clipboard)
         row.addWidget(btn)
-        btn = QPushButton("Load file...")
+        btn = QPushButton("Open file...")
         btn.clicked.connect(self.load_image)
         row.addWidget(btn)
-        self.img_label = QLabel("Source: clipboard")
-        row.addWidget(self.img_label, 1)
+        btn = QPushButton("Preview")
+        btn.clicked.connect(self.preview)
+        row.addWidget(btn)
         dl.addLayout(row)
-        act = QHBoxLayout()
-        for text, fn in [("Preview", self.preview), ("Measure brush", self.measure_brush),
-                         ("Test color", self.test_color), ("Speed test", self.speed_test)]:
-            b = QPushButton(text)
-            b.clicked.connect(fn)
-            act.addWidget(b)
-        dl.addLayout(act)
-        fix = QPushButton("Correct now: screenshot the canvas and fix mistakes")
-        fix.clicked.connect(self.correct_now)
-        dl.addWidget(fix)
-        as_btn = QPushButton("Auto settings: pick the best-looking settings for this picture")
-        as_btn.setToolTip("Tries colors, smoothing, merging, line art and edge settings, renders each "
-                          "drawing offline and keeps what looks most like the picture within the time limit.")
-        as_btn.clicked.connect(self.auto_settings)
-        dl.addWidget(as_btn)
-        cc_btn = QPushButton("Color check: test the picker's colors (fixes dark colors turning black)")
-        cc_btn.clicked.connect(self.color_check)
-        dl.addWidget(cc_btn)
-        sp_btn = QPushButton("Auto speed: find the fastest safe mouse timing")
-        sp_btn.setToolTip("Draws small test patterns at faster and faster timing, checks each with a "
-                          "screenshot, and keeps the fastest that comes out clean.")
-        sp_btn.clicked.connect(self.auto_speed)
-        dl.addWidget(sp_btn)
-        auto = QPushButton("Auto brush: find the best brush sizes for this image")
-        auto.setToolTip("Draws test dots to learn the brush slider, then picks the finest brushes that "
-                        "finish within the time limit (Settings) and applies them.")
-        auto.clicked.connect(self.auto_brush)
-        dl.addWidget(auto)
-        self.preview_label = QLabel("Preview appears here")
+        self.img_label = QLabel("Source: clipboard")
+        self.img_label.setStyleSheet("color: #666;")
+        dl.addWidget(self.img_label)
+        self.preview_label = QLabel("Copy an image, then press Paste image")
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumSize(200, 200)
+        self.preview_label.setStyleSheet("background: #f5f5f5; border: 1px dashed #ccc; color: #888;")
         dl.addWidget(self.preview_label, 1)
         tabs.addTab(draw, "Draw")
 
-        # --- Calibrate tab
+        # --- Calibrate tab: click each point in Roblox
         cal = QWidget()
-        cal_l = QFormLayout(cal)
-        cal_l.addRow(QLabel("Click a button, then hover the target for 3s."))
+        cv = QVBoxLayout(cal)
+        cv.addWidget(hint("Press Set, then click that spot in Roblox (the click isn't passed to the game). "
+                          "Calibrate all walks through every point; Esc skips one."))
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Color picker:"))
         self.picker = QComboBox()
         self.picker.addItem("Color wheel + brightness slider", "wheel")
         self.picker.addItem("Hex text box", "hex")
         self.picker.addItem("Hue ring + color square", "ring")
         self.picker.setCurrentIndex({"wheel": 0, "hex": 1, "ring": 2}.get(self.cfg["picker"], 0))
         self.picker.currentIndexChanged.connect(self.update_picker_rows)
-        cal_l.addRow("Color picker", self.picker)
-        self.cal_labels, self.cal_rows = {}, []
-        for key, label, mode in self.CAL:
-            b = QPushButton(label)
-            b.clicked.connect(lambda _=False, k=key: self.capture(k))
-            lbl = QLabel(self.fmt(self.cfg[key]))
-            cal_l.addRow(b, lbl)
-            self.cal_labels[key] = lbl
-            self.cal_rows.append((mode, b, lbl))
+        top.addWidget(self.picker, 1)
+        cv.addLayout(top)
+        self.cal_all_btn = QPushButton("Calibrate all")
+        self.cal_all_btn.setStyleSheet("font-weight: 600; padding: 6px;")
+        self.cal_all_btn.clicked.connect(self.calibrate_all)
+        cv.addWidget(self.cal_all_btn)
+        self.cal_labels, self.cal_rows, self.cal_names = {}, [], {}
+        for title, optional in (("Required", False), ("Optional", True)):
+            gb = QGroupBox(title)
+            gl = QGridLayout(gb)
+            gl.setVerticalSpacing(2)
+            r = 0
+            for key, label, mode in self.CAL:
+                if ("optional" in label) != optional:
+                    continue
+                name = label.replace(" (optional)", "").replace("(optional, ", "(").replace("(optional: ", "(")
+                self.cal_names[key] = name
+                nl = QLabel(name)
+                nl.setWordWrap(True)
+                vl = QLabel()
+                vl.setMinimumWidth(90)
+                b = QPushButton("Set")
+                b.setFixedWidth(52)
+                b.clicked.connect(lambda _=False, k=key: self.capture(k))
+                ws = [nl, vl, b]
+                gl.addWidget(nl, r, 0)
+                gl.addWidget(vl, r, 1)
+                gl.addWidget(b, r, 2)
+                if optional:
+                    x = QPushButton("Clear")
+                    x.setFixedWidth(52)
+                    x.clicked.connect(lambda _=False, k=key: self.clear_point(k))
+                    gl.addWidget(x, r, 3)
+                    ws.append(x)
+                gl.setColumnStretch(0, 1)
+                self.cal_labels[key] = vl
+                self.cal_rows.append((mode, key, ws))
+                r += 1
+            cv.addWidget(gb)
+        cv.addStretch(1)
         tabs.addTab(self.scrolled(cal), "Calibrate")
+        self.catcher = ClickCatcher(lambda: (self.frameGeometry().x(), self.frameGeometry().y(),
+                                             self.frameGeometry().width(), self.frameGeometry().height()))
+        self.catcher.clicked.connect(self.on_cal_click)
+        self.catcher.skipped.connect(self.on_cal_skip)
+        self.cal_queue, self.cal_key, self._cal_total = [], None, 0
 
-        # --- Settings tab, grouped
-        groups = [("Brushes", ["spacing", "brush_pct", "big_brush_pct", "tiny_brush_pct", "time_limit"]),
-                  ("Image", ["colors", "merge_de", "smooth", "denoise", "min_blob", "edge_contrast", "line_contrast",
-                             "correct_passes"]),
-                  ("Timing", ["frame_ms", "min_frame_ms", "corner_frames", "segment", "color_wait_ms", "picker_ms", "key_ms"])]
+        # --- Tools tab: one-time game setup, per-picture helpers, tests
+        tools = QWidget()
+        tv = QVBoxLayout(tools)
+
+        def tool(layout, text, fn, desc):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            layout.addWidget(b)
+            if desc:
+                layout.addWidget(hint(desc))
+
+        gb = QGroupBox("Once per game (results are saved)")
+        gv = QVBoxLayout(gb)
+        tool(gv, "Auto brush", self.auto_brush, "Draws test dots to learn the brush slider sizes.")
+        tool(gv, "Auto speed", self.auto_speed, "Finds the fastest mouse timing that still draws cleanly.")
+        tool(gv, "Color check", self.color_check, "Tests the picker's colors (stops dark colors turning black).")
+        tv.addWidget(gb)
+        gb = QGroupBox("This picture")
+        gv = QVBoxLayout(gb)
+        tool(gv, "Auto settings", self.auto_settings,
+             "Tries colors, smoothing, merging, line art and edges; keeps what looks best in the time limit.")
+        tool(gv, "Correct now", self.correct_now, "Screenshots the canvas and repaints mistakes.")
+        tv.addWidget(gb)
+        gb = QGroupBox("Tests")
+        gh = QHBoxLayout(gb)
+        for text, fn in [("Measure brush", self.measure_brush), ("Test color", self.test_color),
+                         ("Speed test", self.speed_test)]:
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            gh.addWidget(b)
+        tv.addWidget(gb)
+        tv.addStretch(1)
+        tabs.addTab(self.scrolled(tools), "Tools")
+
+        # --- Settings tab: the common ones, the rest behind "advanced"
+        groups = [("Basics", ["time_limit", "colors", "correct_passes"], False),
+                  ("Brushes", ["spacing", "brush_pct", "big_brush_pct", "tiny_brush_pct"], True),
+                  ("Image", ["merge_de", "smooth", "denoise", "min_blob", "edge_contrast", "line_contrast"], True),
+                  ("Timing", ["frame_ms", "min_frame_ms", "corner_frames", "segment", "color_wait_ms", "picker_ms",
+                              "key_ms"], True)]
         labels = {key: (label, typ) for key, label, typ in self.FIELDS}
         st = QWidget()
         st_l = QVBoxLayout(st)
         self.edits = {}
-        forms = {}
-        for title, keys in groups:
+        forms, self.adv_boxes = {}, []
+        for title, keys, adv in groups:
             gb = QGroupBox(title)
             fl = QFormLayout(gb)
             forms[title] = fl
@@ -3569,35 +3943,44 @@ class App(QWidget):
                 e.setMaximumWidth(80)
                 fl.addRow(label, e)
                 self.edits[key] = (e, typ)
+            if adv:
+                self.adv_boxes.append(gb)
             st_l.addWidget(gb)
+            if title == "Basics":
+                self.show_adv = QCheckBox("Show advanced settings")
+                st_l.addWidget(self.show_adv)
         self.skip_white = QCheckBox("Skip white (canvas is white)")
         self.skip_white.setChecked(self.cfg["skip_white"])
-        forms["Image"].addRow(self.skip_white)
-        self.use_bucket = QCheckBox("Bucket-fill the background (needs bucket + brush tool calibrated)")
+        forms["Basics"].addRow(self.skip_white)
+        self.use_bucket = QCheckBox("Bucket-fill the background")
+        self.use_bucket.setToolTip("Needs the paint bucket and brush tool calibrated")
         self.use_bucket.setChecked(bool(self.cfg.get("use_bucket", True)))
-        forms["Image"].addRow(self.use_bucket)
+        forms["Basics"].addRow(self.use_bucket)
+        self.line_art = QCheckBox("Line art: draw thin curves as lines")
+        self.line_art.setChecked(self.cfg.get("line_art", True))
+        forms["Basics"].addRow(self.line_art)
         self.line_fill = QCheckBox("Follow thin shapes with lines (faster)")
         self.line_fill.setChecked(self.cfg.get("line_fill", True))
         forms["Image"].addRow(self.line_fill)
-        self.line_art = QCheckBox("Line art: draw thin curves (outlines, strands) as lines")
-        self.line_art.setChecked(self.cfg.get("line_art", True))
-        forms["Image"].addRow(self.line_art)
         self.hash_prefix = QCheckBox("Type '#' before hex")
         self.hash_prefix.setChecked(self.cfg["hash_prefix"])
         forms["Timing"].addRow(self.hash_prefix)
+        self.show_adv.toggled.connect(lambda v: [g.setVisible(v) for g in self.adv_boxes])
+        for g in self.adv_boxes:
+            g.setVisible(False)
         st_l.addStretch(1)
         tabs.addTab(self.scrolled(st), "Settings")
         self.update_picker_rows()
 
-        # --- always visible: start button + status
+        # --- always visible: progress (while drawing), start row, status
         self.progress_panel = ProgressPanel()
         root.addWidget(self.progress_panel)
         bar = QHBoxLayout()
         bar.addWidget(QLabel("Time left:"))
         self.time_left = QLineEdit()
-        self.time_left.setPlaceholderText("e.g. 95 or 1:35")
-        self.time_left.setToolTip("Optional. Seconds left in the round: the drawing is re-planned to finish in time.")
-        self.time_left.setMaximumWidth(110)
+        self.time_left.setPlaceholderText("95 or 1:35")
+        self.time_left.setToolTip("Optional. Seconds left in the round: the drawing is planned to finish in time.")
+        self.time_left.setMaximumWidth(90)
         bar.addWidget(self.time_left)
         self.autotune = QCheckBox("Auto-tune")
         self.autotune.setToolTip("Before drawing, pick brush sizes and settings for this picture "
@@ -3605,12 +3988,16 @@ class App(QWidget):
         self.autotune.setChecked(bool(self.cfg.get("autotune", False)))
         self.autotune.toggled.connect(lambda v: (self.cfg.update(autotune=bool(v)), self.save()))
         bar.addWidget(self.autotune)
-        self.start_btn = QPushButton("Start drawing (5s)")
+        self.start_btn = QPushButton()
+        self.start_btn.setMinimumHeight(34)
+        self.start_btn.setStyleSheet("QPushButton { font-weight: 700; font-size: 14px; }")
         self.start_btn.clicked.connect(self.start)
         bar.addWidget(self.start_btn, 1)
         root.addLayout(bar)
+        self.update_start_label()
         self.status_label = QLabel("Calibrate, copy an image, then Start. Press Esc (or move the mouse) to stop drawing.")
         self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #444;")
         root.addWidget(self.status_label)
 
         QTimer.singleShot(500, lambda: [pool().submit(_noop) for _ in range(os.cpu_count() or 2)])
@@ -3618,8 +4005,90 @@ class App(QWidget):
 
         avail = QApplication.primaryScreen().availableGeometry() if QApplication.primaryScreen() else None
         max_h = int(avail.height() * 0.85) if avail else 700
-        self.resize(480, min(720, max_h))
+        self.resize(460, min(720, max_h))
         self.setMinimumWidth(420)
+
+    def update_start_label(self):
+        self.start_btn.setText("Start drawing" if self.cfg.get("focus_spot") else "Start drawing (5s)")
+
+    def set_cal_label(self, key):
+        p = self.cfg.get(key)
+        lbl = self.cal_labels[key]
+        lbl.setText(f"✓ {p[0]:.0f}, {p[1]:.0f}" if p else "not set")
+        lbl.setStyleSheet("color: #15803d;" if p else "color: #999;")
+
+    def capture(self, key):
+        """Wait for the next click outside this window and store it as point `key`."""
+        self.cal_queue, self._cal_total = [], 0
+        self._begin_capture(key)
+
+    def calibrate_all(self):
+        if self.cal_key is not None:  # pressed again: stop
+            self._end_capture("Calibration stopped")
+            return
+        keys = [k for m, k, _ in self.cal_rows if m in ("all", self.picker.currentData())]
+        req = [k for k in keys if "optional" not in dict((c[0], c[1]) for c in self.CAL)[k]]
+        self.cal_queue = req + [k for k in keys if k not in req]
+        self._cal_total = len(self.cal_queue)
+        self._next_capture()
+
+    def _begin_capture(self, key):
+        if self.drawing:
+            return
+        self.cal_key = key
+        for _, k, ws in self.cal_rows:
+            ws[0].setStyleSheet("font-weight: 700; color: #1d4ed8;" if k == key else "")
+        prog = f" ({self._cal_total - len(self.cal_queue)}/{self._cal_total})" if self._cal_total else ""
+        self.set_status_main(f"Click: {self.cal_names[key]}{prog}  -  Esc = skip")
+        self.cal_all_btn.setText("Stop calibrating")
+        self.catcher.start()
+        if not self.catcher._tap_ok:
+            self.set_status_main(self.status_label.text() + "  (the click also reaches the game: allow "
+                                 "Accessibility for this app to block it)")
+
+    def _next_capture(self):
+        if not self.cal_queue:
+            return self._end_capture("Calibration done")
+        key = self.cal_queue.pop(0)
+        self._begin_capture(key)
+
+    def _end_capture(self, msg):
+        self.catcher.stop()
+        self.cal_key, self.cal_queue, self._cal_total = None, [], 0
+        for _, _, ws in self.cal_rows:
+            ws[0].setStyleSheet("")
+        self.cal_all_btn.setText("Calibrate all")
+        self.set_status_main(msg)
+
+    def on_cal_click(self, x, y):
+        key = self.cal_key
+        if key is None:
+            return
+        self.cfg[key] = [x, y]
+        self.set_cal_label(key)
+        self.save()
+        if key == "focus_spot":
+            self.update_start_label()
+        if self.cal_queue:
+            self._next_capture()
+        else:
+            self._end_capture("Calibration done" if self._cal_total else
+                              f"Set {self.cal_names[key]} at ({x:.0f}, {y:.0f})")
+
+    def on_cal_skip(self):
+        if self.cal_key is None:
+            return
+        if self.cal_queue:
+            self._next_capture()
+        else:
+            self._end_capture("Skipped")
+
+    def clear_point(self, key):
+        self.cfg[key] = None
+        self.set_cal_label(key)
+        self.save()
+        if key == "focus_spot":
+            self.update_start_label()
 
     @staticmethod
     def scrolled(widget):
@@ -3632,9 +4101,10 @@ class App(QWidget):
 
     def update_picker_rows(self):
         mode = self.picker.currentData()
-        for m, b, lbl in self.cal_rows:
-            b.setVisible(m in ("all", mode))
-            lbl.setVisible(m in ("all", mode))
+        for m, key, ws in self.cal_rows:
+            for w in ws:
+                w.setVisible(m in ("all", mode))
+            self.set_cal_label(key)
         self.hash_prefix.setVisible(mode == "hex")
         self.cfg["picker"] = mode
 
@@ -3682,17 +4152,6 @@ class App(QWidget):
         with open(CONFIG_PATH, "w") as f:
             json.dump(self.cfg, f, indent=2)
 
-    def capture(self, key, n=3):
-        if n > 0:
-            self.set_status_main(f"Hover over target... {n}")
-            QTimer.singleShot(1000, lambda: self.capture(key, n - 1))
-            return
-        x, y = mouse_pos()
-        self.cfg[key] = [x, y]
-        self.cal_labels[key].setText(self.fmt(self.cfg[key]))
-        self.save()
-        self.set_status_main(f"Captured {key} at ({x:.0f}, {y:.0f})")
-
     def load_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Choose image", "", "Images (*.png *.jpg *.jpeg *.gif *.bmp *.webp *.tiff);;All files (*)")
@@ -3730,7 +4189,7 @@ class App(QWidget):
             return Image.open(self.image_path)
         return self.clipboard_image()
 
-    def make_plan(self):
+    def plan_checks(self):
         self.read_settings()
         self.missing_calibration()
         tl, br = self.cfg["canvas_tl"], self.cfg["canvas_br"]
@@ -3740,7 +4199,6 @@ class App(QWidget):
         gw, gh = int((br[0] - tl[0]) / s), int((br[1] - tl[1]) / s)
         if gw < 1 or gh < 1:
             raise ValueError("Spacing too large for canvas")
-        return build_plan(*plan_args(self.source_image(), self.cfg), **plan_kw(self.cfg))
 
     def big_brush_on(self):
         return bool(self.cfg["brush_min"] and self.cfg["brush_max"] and self.cfg["big_brush_pct"] > 0
@@ -3771,27 +4229,60 @@ class App(QWidget):
         return bool(self.cfg.get("brush_min") and self.cfg.get("brush_max") and curve and len(curve) >= 2)
 
     def preview(self):
-        note = ""
+        """Plan the picture in the background (the search can take a while) and show it."""
         try:
-            img0 = self.source_image()
-            if self.can_repick(img0):  # show what Start will draw: sizes re-picked for this picture
-                self.read_settings()
+            img = self.source_image()
+            img.load()
+            self.read_settings()
+            repick = self.can_repick(img)
+            if repick:
                 self.missing_calibration()
-                self.set_status_main("Picking brush sizes for this picture...")
-                QApplication.processEvents()
-                img = img0
-                cfg, plan, est, desc = fit_to_time(img, dict(self.cfg), 0.93 * self.cfg["time_limit"])
-                note = f" | brushes for this picture: {desc}"
             else:
-                img, plan = self.make_plan()
-                cfg = self.cfg
+                self.plan_checks()
         except Exception as e:
             self.error(str(e))
             return
-        tl, br, sp = cfg["canvas_tl"], cfg["canvas_br"], cfg["spacing"]
-        gw, gh = int((br[0] - tl[0]) / sp), int((br[1] - tl[1]) / sp)
-        sizes = brush_sizes(cfg)
-        shown = simulate(plan, gw, gh, sp, sizes, 380)
+        self._preview_gen += 1
+        gen, cfg0 = self._preview_gen, dict(self.cfg)
+        msg = "Picking brush sizes for this picture..." if repick else "Planning preview..."
+        self.set_status_main(msg)
+        if repick:
+            PLAN_METER.reset(search_guess(cfg0, False))
+            self._pv_msg = msg
+            self._pv_timer.start(300)
+
+        def work():
+            try:
+                note = ""
+                if repick:  # show what Start will draw: sizes re-picked for this picture
+                    cfg, plan, est, desc = fit_to_time(img, dict(cfg0), 0.93 * cfg0["time_limit"])
+                    note = f" | brushes for this picture: {desc}"
+                else:
+                    cfg = cfg0
+                    _, plan = build_plan(*plan_args(img, cfg), **plan_kw(cfg))
+                tl, br, sp = cfg["canvas_tl"], cfg["canvas_br"], cfg["spacing"]
+                gw, gh = int((br[0] - tl[0]) / sp), int((br[1] - tl[1]) / sp)
+                shown = simulate(plan, gw, gh, sp, brush_sizes(cfg), 380)
+                self.bridge.preview_done.emit(gen, (cfg, plan, shown, note))
+            except Exception as e:
+                self.bridge.preview_done.emit(gen, e)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _preview_tick(self):
+        if self._pv_done == self._preview_gen:
+            return self._pv_timer.stop()
+        if not self.drawing:
+            self.set_status_main(f"{self._pv_msg} {PLAN_METER.text()}")
+
+    def show_preview(self, gen, res):
+        if gen != self._preview_gen:
+            return  # an older preview finished after a newer one started
+        self._pv_done = gen
+        if isinstance(res, Exception):
+            self.error(str(res))
+            return
+        cfg, plan, shown, note = res
+        sp = cfg["spacing"]
         data = shown.tobytes("raw", "RGB")
         qimg = QImage(data, shown.width, shown.height, 3 * shown.width, QImage.Format_RGB888).copy()
         self.preview_label.setPixmap(QPixmap.fromImage(qimg))
@@ -4095,7 +4586,7 @@ class App(QWidget):
                 total = float(left.replace("s", "").split(":")[-1]) + (
                     60 * float(left.split(":")[0]) if ":" in left else 0)
             else:  # no clock given: the drawing time limit is the deadline
-                total = float(self.cfg["time_limit"]) + 6.5
+                total = float(self.cfg["time_limit"]) + (2.0 if self.cfg.get("focus_spot") else 6.5)
         except Exception as e:
             self.error(str(e))
             return
@@ -4106,9 +4597,11 @@ class App(QWidget):
         tune = self.autotune.isChecked()
         exact = not left and not tune and not self.can_repick(img)  # use these exact settings
 
+        lead = 0.5 if self.cfg.get("focus_spot") else 5.0
+
         def left_for_drawing():
-            # planning runs during the 5s countdown; drawing starts when both are done (+~1.5s clicks)
-            return total / rate - max(5.0, time.time() - clicked) - 1.5
+            # planning runs during the countdown; drawing starts when both are done (+~1.5s clicks)
+            return total / rate - max(lead, time.time() - clicked) - 1.5
 
         curve = cfg.get("brush_curve")
         early = bool(curve and len(curve) >= 2 and ((cfg.get("brush_min") and cfg.get("brush_max")) or has_arrows(cfg)))
@@ -4132,8 +4625,10 @@ class App(QWidget):
 
         def prepare(note):
             budget = left_for_drawing()
+            PLAN_METER.reset(2 if exact else search_guess(cfg, tune))
             if not early:
                 c, plan, est, desc = plan_full(note, budget, cfg)
+                note["planned"] = True
                 remaining = left_for_drawing()
                 state["plan"] = plan
                 note["msg"] = (f"{desc}, ~{est:.0f}s of {remaining:.0f}s"
@@ -4168,6 +4663,7 @@ class App(QWidget):
                     note["msg"] = f"planning failed ({e}): using the quick plan"
                     pend.result = (qc, qplan[len(bg):], "quick plan")
                 finally:
+                    note["planned"] = True
                     pend.ready.set()
 
             threading.Thread(target=work, daemon=True).start()
@@ -4299,6 +4795,8 @@ class App(QWidget):
         and returns the cfg to draw with. planning: a background plan is already running."""
         if self.drawing:
             return
+        if self.cfg.get("focus_spot"):
+            stages = tuple(st for st in stages if st != "countdown")
         self.progress_panel.begin(stages)
         prog = self.bridge.progress.emit
         self.drawing = True
@@ -4306,12 +4804,22 @@ class App(QWidget):
         self.start_btn.setEnabled(False)
         emit = self.bridge.status.emit
 
+        focus = self.cfg.get("focus_spot")
+        wait_s = 0.0 if focus else 5.0
+
         def worker():
             boost_thread()
             try:
                 note, result = {}, {}
                 if prepare or planning:
-                    prog("plan", -1, "planning alongside the countdown...", "")
+                    prog("plan", -1, "planning...", "")
+
+                    def meter():  # planning bar: candidate plans done / expected, until planned
+                        while not note.get("planned") and self.drawing:
+                            if PLAN_METER.expected or PLAN_METER.guess:
+                                prog("plan", PLAN_METER.frac(), PLAN_METER.text(), "")
+                            time.sleep(0.3)
+                    threading.Thread(target=meter, daemon=True).start()
                 if prepare:  # plan during the countdown instead of before it
                     def run_prepare():
                         try:
@@ -4320,7 +4828,7 @@ class App(QWidget):
                             result["error"] = e
                     th = threading.Thread(target=run_prepare, daemon=True)
                     th.start()
-                go_at, shown = time.time() + 5.0, None  # wall clock: background planning can't stretch it
+                go_at, shown = time.time() + wait_s, None  # wall clock: background planning can't stretch it
                 while (left := go_at - time.time()) > 0:
                     if stop_key_down():
                         raise Aborted("Esc pressed")
@@ -4329,25 +4837,29 @@ class App(QWidget):
                     if msg != shown:
                         emit(msg)
                         shown = msg
-                    prog("countdown", 1 - left / 5.0, f"{math.ceil(left)}s - focus the Roblox window", "")
+                    prog("countdown", 1 - left / wait_s, f"{math.ceil(left)}s - focus the Roblox window", "")
                     time.sleep(min(0.05, max(0.0, left)))
                 cfg = self.cfg
                 if prepare:
                     while th.is_alive():  # planning outlasted the countdown
                         if stop_key_down():
                             raise Aborted("Esc pressed")
-                        emit(f"Still planning... {note.get('msg', '')}")
+                        emit(f"Planning... {note.get('msg', '')}")
                         th.join(0.2)
                     if "error" in result:
                         raise result["error"]
                     cfg = result["cfg"]
-                    prog("plan", 1.0, note.get("msg", "done")[:60], "")
+                    if note.get("planned"):
+                        prog("plan", 1.0, note.get("msg", "done")[:60], "")
                     emit(f"Drawing: {note.get('msg', '')}")
                 prog("countdown", 1.0, "done", "")
+                if focus:  # bring Roblox to the front and click the safe spot (no countdown)
+                    focus_roblox(focus)
                 drw = Drawer(cfg, self.stop_event, emit, prog)
                 drw.on_timing = self.bridge.timing.emit
                 job(drw)
                 prog("end", 0, "done", "")
+                note["planned"] = True
             except Aborted as e:
                 _post(Quartz.kCGEventLeftMouseUp, *mouse_pos())
                 emit(f"Aborted: {e}")
