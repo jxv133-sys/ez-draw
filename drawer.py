@@ -14,11 +14,12 @@ import cv2
 import numpy as np
 import Quartz
 from PIL import Image, ImageFilter, ImageOps
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QFile, QObject, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame,
-                               QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-                               QProgressBar, QPushButton, QScrollArea, QTabWidget, QVBoxLayout, QWidget)
+                               QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+                               QListView, QListWidget, QListWidgetItem, QMessageBox, QProgressBar,
+                               QPushButton, QScrollArea, QTabWidget, QVBoxLayout, QWidget)
 
 sys.setswitchinterval(0.001)  # keep the drawing thread on time while planning runs alongside
 
@@ -62,6 +63,8 @@ def keep_awake():
         pass
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drawer_log.txt")
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "library")  # local only (gitignored)
+LIB_EXT = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff")
 
 DEFAULTS = {
     "canvas_tl": None,       # [x, y] screen points
@@ -3618,6 +3621,7 @@ class Bridge(QObject):
     progress = Signal(str, float, str, str)
     auto_done = Signal(dict)
     preview_done = Signal(int, object)
+    lib_scored = Signal(str, object)
 
 
 class ClickCatcher(QObject):
@@ -3827,6 +3831,46 @@ class App(QWidget):
         self.preview_label.setStyleSheet("background: #f5f5f5; border: 1px dashed #ccc; color: #888;")
         dl.addWidget(self.preview_label, 1)
         tabs.addTab(draw, "Draw")
+
+        # --- Library tab: saved pictures (local folder), scored by how well they'd draw
+        lib = QWidget()
+        lv = QVBoxLayout(lib)
+        lv.addWidget(hint("Click a picture to use it. Fit = how close the drawing gets to the picture with "
+                          "your current brushes (higher is better); drop image files here to add them."))
+        row = QHBoxLayout()
+        for text, fn in [("Save pasted", self.lib_add_clipboard), ("Add files...", self.lib_add_files),
+                         ("Score all", self.lib_score_all)]:
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        lv.addLayout(row)
+        self.lib_list = QListWidget()
+        self.lib_list.setViewMode(QListView.IconMode)
+        self.lib_list.setIconSize(QSize(104, 104))
+        self.lib_list.setGridSize(QSize(124, 150))
+        self.lib_list.setResizeMode(QListView.Adjust)
+        self.lib_list.setMovement(QListView.Static)
+        self.lib_list.setWordWrap(True)
+        self.lib_list.itemClicked.connect(self.lib_pick)
+        lv.addWidget(self.lib_list, 1)
+        row = QHBoxLayout()
+        self.lib_sort = QComboBox()
+        self.lib_sort.addItem("Best fit first", "fit")
+        self.lib_sort.addItem("Newest first", "new")
+        self.lib_sort.addItem("Name", "name")
+        self.lib_sort.currentIndexChanged.connect(lambda _: self.lib_refresh())
+        row.addWidget(QLabel("Sort:"))
+        row.addWidget(self.lib_sort, 1)
+        for text, fn in [("Remove", self.lib_remove), ("Open folder", self.lib_open_folder)]:
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        lv.addLayout(row)
+        tabs.addTab(lib, "Library")
+        self.setAcceptDrops(True)
+        self.bridge.lib_scored.connect(self.lib_on_scored)
+        self.lib_scores, self.lib_scoring = self.lib_load_scores(), set()
+        self.lib_refresh()
 
         # --- Calibrate tab: click each point in Roblox
         cal = QWidget()
@@ -4151,6 +4195,216 @@ class App(QWidget):
     def save(self):
         with open(CONFIG_PATH, "w") as f:
             json.dump(self.cfg, f, indent=2)
+
+    # ---------- library ----------
+    @staticmethod
+    def lib_files():
+        if not os.path.isdir(LIB_DIR):
+            return []
+        return [os.path.join(LIB_DIR, f) for f in os.listdir(LIB_DIR)
+                if f.lower().endswith(LIB_EXT) and not f.startswith(".")]
+
+    @staticmethod
+    def lib_load_scores():
+        try:
+            with open(os.path.join(LIB_DIR, ".scores.json")) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def lib_save_scores(self):
+        try:
+            os.makedirs(LIB_DIR, exist_ok=True)
+            with open(os.path.join(LIB_DIR, ".scores.json"), "w") as f:
+                json.dump(self.lib_scores, f, indent=1)
+        except OSError:
+            pass
+
+    def lib_score_key(self):
+        """Scores depend on the brushes, canvas and image settings: re-score when they change."""
+        keys = ("spacing", "brush_pct", "big_brush_pct", "tiny_brush_pct", "brush_pt", "big_brush_pt",
+                "tiny_brush_pt", "colors", "merge_de", "smooth", "denoise", "min_blob", "edge_contrast",
+                "line_art", "line_fill", "use_bucket", "skip_white", "canvas_tl", "canvas_br",
+                "bucket_tool", "brush_tool")
+        return json.dumps([self.cfg.get(k) for k in keys], default=str)
+
+    def lib_score_of(self, path):
+        sc = self.lib_scores.get(os.path.basename(path))
+        if sc and sc.get("mtime") == os.path.getmtime(path) and sc.get("key") == self.lib_score_key():
+            return sc
+        return None
+
+    @staticmethod
+    def fit_of(err):
+        return max(0, min(100, round(100 - 4 * err)))
+
+    def lib_refresh(self):
+        files = self.lib_files()
+        mode = self.lib_sort.currentData()
+        if mode == "new":
+            files.sort(key=os.path.getmtime, reverse=True)
+        elif mode == "name":
+            files.sort(key=lambda p: os.path.basename(p).lower())
+        else:  # best fit first, unscored last
+            def k(p):
+                sc = self.lib_score_of(p)
+                return (0, sc["err"]) if sc else (1, 0.0)
+            files.sort(key=k)
+        if not hasattr(self, "_lib_thumbs"):
+            self._lib_thumbs = {}
+        cur = self.image_path
+        self.lib_list.clear()
+        limit = float(self.cfg.get("time_limit") or 0)
+        for p in files:
+            mt = os.path.getmtime(p)
+            icon = self._lib_thumbs.get(p)
+            if icon is None or icon[0] != mt:
+                try:
+                    im = Image.open(p)
+                    im = ImageOps.exif_transpose(im).convert("RGBA")
+                    im.thumbnail((104, 104))
+                    data = im.tobytes("raw", "RGBA")
+                    q = QImage(data, im.width, im.height, 4 * im.width, QImage.Format_RGBA8888).copy()
+                    icon = (mt, QIcon(QPixmap.fromImage(q)))
+                except Exception:
+                    icon = (mt, QIcon())
+                self._lib_thumbs[p] = icon
+            name = os.path.splitext(os.path.basename(p))[0]
+            sc = self.lib_score_of(p)
+            if p in self.lib_scoring:
+                sub = "scoring..."
+            elif sc:
+                sub = f"fit {self.fit_of(sc['err'])} \u00b7 ~{sc['est']:.0f}s" + (" \u26a0" if limit and sc["est"] > limit else "")
+            else:
+                sub = "not scored"
+            it = QListWidgetItem(icon[1], f"{name[:18]}\n{sub}")
+            it.setData(Qt.UserRole, p)
+            it.setToolTip(f"{os.path.basename(p)}\n{sub}" + ("\n\u26a0 takes longer than the time limit with "
+                                                           "these brushes (Start simplifies it)" if "\u26a0" in sub else ""))
+            self.lib_list.addItem(it)
+            if p == cur:
+                it.setSelected(True)
+
+    def lib_unique(self, name, ext=".png"):
+        os.makedirs(LIB_DIR, exist_ok=True)
+        base = "".join(ch for ch in name if ch.isalnum() or ch in " -_").strip() or "picture"
+        path, n = os.path.join(LIB_DIR, base + ext), 2
+        while os.path.exists(path):
+            path, n = os.path.join(LIB_DIR, f"{base} {n}{ext}"), n + 1
+        return path
+
+    def lib_add_clipboard(self):
+        try:
+            img = self.clipboard_image()
+            img.load()
+        except Exception as e:
+            self.error(str(e))
+            return
+        name, ok = QInputDialog.getText(self, "Save to library", "Name:",
+                                        text=time.strftime("picture %Y-%m-%d %H%M"))
+        if not ok:
+            return
+        path = self.lib_unique(name)
+        ImageOps.exif_transpose(img).save(path)
+        self.lib_added([path])
+
+    def lib_add_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Add pictures", "", "Images (*.png *.jpg *.jpeg *.gif *.bmp *.webp *.tiff)")
+        self.lib_import(paths)
+
+    def lib_import(self, paths):
+        import shutil
+        added = []
+        for src in paths:
+            if not src.lower().endswith(LIB_EXT) or os.path.dirname(os.path.abspath(src)) == LIB_DIR:
+                continue
+            stem, ext = os.path.splitext(os.path.basename(src))
+            dst = self.lib_unique(stem, ext.lower())
+            shutil.copy2(src, dst)
+            added.append(dst)
+        if added:
+            self.lib_added(added)
+
+    def lib_added(self, paths):
+        self.set_status_main(f"Added {len(paths)} picture{'s' * (len(paths) != 1)} to the library")
+        self.lib_score(paths)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        self.lib_import([u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()])
+
+    def lib_pick(self, item):
+        p = item.data(Qt.UserRole)
+        if not p or not os.path.exists(p):
+            return self.lib_refresh()
+        self.image_path = p
+        self.img_label.setText(f"Library: {os.path.basename(p)}")
+        self.preview()
+
+    def lib_remove(self):
+        items = self.lib_list.selectedItems()
+        if not items:
+            return
+        p = items[0].data(Qt.UserRole)
+        if QFile.moveToTrash(p):  # recoverable from the Trash
+            self.lib_scores.pop(os.path.basename(p), None)
+            self.lib_save_scores()
+            if self.image_path == p:
+                self.image_path = None
+                self.img_label.setText("Source: clipboard")
+            self.set_status_main(f"Moved {os.path.basename(p)} to the Trash")
+        self.lib_refresh()
+
+    def lib_open_folder(self):
+        os.makedirs(LIB_DIR, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(LIB_DIR))
+
+    def lib_score_all(self):
+        self.lib_score([p for p in self.lib_files() if self.lib_score_of(p) is None] or self.lib_files())
+
+    def lib_score(self, paths):
+        """Plan + render each picture with the current brushes in the background (in parallel)."""
+        try:
+            self.read_settings()
+            self.plan_checks()
+        except Exception as e:
+            self.lib_refresh()
+            self.set_status_main(f"Added; not scored ({e})")
+            return
+        cfg, key = dict(self.cfg), self.lib_score_key()
+        paths = [p for p in paths if p not in self.lib_scoring]
+        self.lib_scoring.update(paths)
+        self.lib_refresh()
+
+        def work():
+            futs = []
+            for p in paths:
+                try:
+                    img = Image.open(p)
+                    img.load()
+                    futs.append((p, os.path.getmtime(p), pool().submit(_quality_job, img.convert("RGB"), cfg)))
+                except Exception as e:
+                    self.bridge.lib_scored.emit(p, e)
+            for p, mt, f in futs:
+                try:
+                    err, est = f.result()
+                    self.bridge.lib_scored.emit(p, {"mtime": mt, "key": key, "err": err, "est": est})
+                except Exception as e:
+                    self.bridge.lib_scored.emit(p, e)
+        threading.Thread(target=work, daemon=True).start()
+
+    def lib_on_scored(self, p, res):
+        self.lib_scoring.discard(p)
+        if isinstance(res, dict):
+            self.lib_scores[os.path.basename(p)] = res
+            self.lib_save_scores()
+        if not self.lib_scoring:
+            self.set_status_main("Library scored")
+        self.lib_refresh()
 
     def load_image(self):
         path, _ = QFileDialog.getOpenFileName(
