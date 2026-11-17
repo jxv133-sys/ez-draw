@@ -2903,38 +2903,46 @@ class Drawer:
                     room["safe"].update(chg)
             return ok
 
+        def trial2(label, **chg):
+            """A fail only counts if it happens twice (one lag spike shouldn't stop the search)."""
+            r = trial(label, **chg)
+            if r is False:
+                r = trial(label + " (retry)", **chg)
+            return r
+
         self.activate()
         self.set_color("000000")
         if self.cfg.get("brush_min") and self.cfg.get("brush_max"):
             self.set_brush(base["brush_pct"])
         interpolates = True
-        if not trial(f"current settings ({cur['frame_ms']}ms)"):
+        if not trial2(f"current settings ({cur['frame_ms']}ms)"):
             # maybe the game only paints where the mouse is sampled: try many points per row
             if not trial("points every brush width", segment=max(2.0, round(0.8 * b, 1))):
                 raise RuntimeError("Even the current settings don't draw cleanly - check the canvas calibration "
                                    "and brush size (Measure brush), or raise Event delay.")
             interpolates = False
         if cur["corner_frames"] > 1:
-            trial("corner hold 1 frame", corner_frames=1)
+            trial2("corner hold 1 frame", corner_frames=1)
         if interpolates and cur["segment"] < 9999:
-            trial("long rows as one move", segment=9999)
-        fastest = cur["frame_ms"]
-        for f in (14, 12, 10, 8, 7, 6, 5, 4, 3):
-            if f >= fastest:
-                continue
-            r = trial(f"event delay {f}ms", frame_ms=f)
-            if not r:
+            trial2("long rows as one move", segment=9999)
+        steps = [f for f in (14, 12, 10, 8, 7, 6, 5, 4, 3) if f < cur["frame_ms"]]
+        passed = [cur["frame_ms"]]
+        for f in steps:
+            if not trial2(f"event delay {f}ms", frame_ms=f):
                 break
-            fastest = f
-        if fastest < base["frame_ms"]:  # confirm the fastest once more; back off if it's flaky
-            again = trial(f"event delay {fastest}ms (repeat)", frame_ms=fastest)
-            if again is False:
-                cur["frame_ms"] = min(base["frame_ms"], int(math.ceil(fastest * 1.4)))
-                log.append(f"backing off to {cur['frame_ms']}ms")
+            passed.append(f)
+        # confirm the fastest once more; if flaky, step back one level at a time
+        while len(passed) > 1:
+            f = passed[-1]
+            if trial(f"event delay {f}ms (confirm)", frame_ms=f) is not False:
+                break
+            passed.pop()
+            cur["frame_ms"] = passed[-1]
+            log.append(f"{f}ms is flaky: backing off to {cur['frame_ms']}ms")
         self.set_color("000000")
         for cw in (150, 100, 60, 30):
             if cw < cur["color_wait_ms"]:
-                if not trial(f"color wait {cw}ms", color_wait_ms=cw):
+                if not trial2(f"color wait {cw}ms", color_wait_ms=cw):
                     break
         self.cfg = base
         self.frame = self.frame0 = base["frame_ms"] / 1000.0
@@ -5225,6 +5233,11 @@ class App(QWidget):
             self.edits[k][0].setText(str(res[k]))
         self.read_settings()
         changed = ", ".join(f"{k} {before[k]} -> {res[k]}" for k in res if before[k] != res[k]) or "no faster settings passed"
+        try:
+            with open(LOG_PATH, "w") as f:
+                f.write("Auto speed: " + changed + "\n" + "\n".join(log) + "\n")
+        except OSError:
+            pass
         self.set_status_main("Auto speed: " + changed + ". Clear the canvas. | " + " | ".join(log))
 
     def apply_auto_brush(self, res):
