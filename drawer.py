@@ -2779,6 +2779,20 @@ class Drawer:
             return None
         img, sc = cap
         dark = img.mean(2) < 90
+        # the real line width, from the ink along the expected paths (measured brush sizes can
+        # be off): check coverage against what the brush actually draws
+        center = np.zeros(dark.shape, np.uint8)
+        for pts in strokes:
+            P = np.round((np.array(pts) - [ox, oy]) * sc * 16).astype(np.int32)
+            cv2.polylines(center, [P], False, 1, 1, cv2.LINE_8, 4)
+        kw = int((b * 0.75 + 4) * sc) * 2 + 1
+        along = cv2.dilate(center, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kw, kw))).astype(bool)
+        b_seen = (dark & along).sum() / max(1, center.sum()) / sc
+        if 0.3 * b <= b_seen < 0.9 * b:
+            if abs(b_seen - getattr(self, "_b_seen_logged", 0)) > 0.5:
+                log(f"auto speed: the test brush draws {b_seen:.1f}pt wide, not {b:.1f}pt: checking against that")
+                self._b_seen_logged = b_seen
+            b = b_seen
         exp = np.zeros(dark.shape, np.uint8)
         th = max(1, int(round(b * sc)))
         for pts in strokes:
@@ -2786,13 +2800,29 @@ class Drawer:
             cv2.polylines(exp, [P], False, 1, th, cv2.LINE_8, 4)
             for q in P:
                 cv2.circle(exp, (int(q[0]), int(q[1])), int(b * sc / 2 * 16), 1, -1, cv2.LINE_8, 4)
+        # a calibration a point or two off shifts all the ink: line the expected pattern up
+        # with what was drawn first (up to ~4pt), so only timing problems fail the test
+        r = max(1, int(round(4 * sc)))
+        best = (-1, 0, 0)
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                m = np.roll(exp, (dy, dx), axis=(0, 1))
+                hit = int((dark & (m > 0)).sum())
+                if hit > best[0]:
+                    best = (hit, dy, dx)
+        if best[1] or best[2]:
+            exp = np.roll(exp, (best[1], best[2]), axis=(0, 1))
+            if (best[1], best[2]) != getattr(self, "_shift_logged", None):
+                log(f"auto speed: ink is {best[2] / sc:+.1f}pt x, {best[1] / sc:+.1f}pt y from the calibrated "
+                    "spot (canvas calibration slightly off): checking at the drawn position")
+                self._shift_logged = (best[1], best[2])
         k1 = max(1, int(b * sc * 0.35)) | 1
         core = cv2.erode(exp, np.ones((k1, k1), np.uint8)).astype(bool)
         k2 = int((b * 0.5 + 4) * sc) * 2 + 1
         near = cv2.dilate(exp, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k2, k2))).astype(bool)
         coverage = dark[core].mean() if core.any() else 0.0
         stray = int((dark & ~near).sum())
-        ok = coverage >= 0.97 and stray <= (b * sc) ** 2 * 1.5
+        ok = coverage >= 0.93 and stray <= (b * sc) ** 2 * 1.5  # gaps / streaks also leave stray ink
         if not ok:  # keep what was seen next to what was expected, for the log
             try:
                 os.makedirs(DEBUG_DIR, exist_ok=True)
@@ -3469,10 +3499,11 @@ def cancel_searches(tag):
     _TAGGED_FUTS[:] = keep
 
 
-def sizes_for(fine, d_min, d_max):
-    """Brush set for a fine size: big ~5x fine (if the slider goes that big), tiny = smallest."""
+def sizes_for(fine, d_min, d_max, edges=True):
+    """Brush set for a fine size: big ~5x fine (if the slider goes that big), tiny = smallest
+    (none with edges=False: no edge pass)."""
     big = min(d_max * 0.9, 5 * fine)
-    return fine, (big if big >= 3 * fine else None), (d_min if d_min <= TINY_MAX_RATIO * fine else None)
+    return fine, (big if big >= 3 * fine else None), (d_min if edges and d_min <= TINY_MAX_RATIO * fine else None)
 
 
 def prep_configs(cfg):
@@ -3558,13 +3589,34 @@ class PlanMeter:
 PLAN_METER = PlanMeter()
 
 
+QUALITY = {  # speed vs detail: smallest fine brush the search may pick, colors, planning time
+    "fast": {"edges": False, "min_fine": 6.0, "max_colors": 16, "detail": False, "plan_share": 0.15, "tune_colors": (8, 12, 16),
+             "label": "Fast", "tip": "Fine brush 6pt or bigger, up to 16 colors, no edge pass or line art: "
+                                     "plans in seconds, draws quickly"},
+    "balanced": {"edges": True, "min_fine": 4.3, "max_colors": 24, "detail": True, "plan_share": 0.25, "tune_colors": (12, 18, 24),
+                 "label": "Balanced", "tip": "Fine brush 4.3pt or bigger, up to 24 colors"},
+    "best": {"edges": True, "min_fine": 3.0, "max_colors": 32, "detail": True, "plan_share": 0.3, "tune_colors": (12, 20, 28),
+             "label": "Best", "tip": "Smallest brushes and most colors: slow to plan and draw"},
+}
+
+
+def quality(cfg):
+    return QUALITY.get(cfg.get("quality"), QUALITY["balanced"])
+
+
+def fine_range(cfg, d_min, d_max):
+    """Range of fine brush sizes the search may pick (the quality preset sets the smallest)."""
+    hi = max(3.0, min(d_max, 30))
+    return min(max(quality(cfg)["min_fine"], d_min), hi), hi
+
+
 def search_guess(cfg, tune):
     """Rough number of plans the Start search makes (for the planning bar)."""
     curve = cfg.get("brush_curve")
     n = 2
     if curve and len(curve) >= 2:
         d0, d1 = curve_range(cfg, sorted(curve))
-        lo, hi = max(3.0, d0), max(3.0, min(d1, 30))
+        lo, hi = fine_range(cfg, d0, d1)
         n += len([f for f in FINE_CANDIDATES if lo <= f <= hi]) + 1
     return n + (19 if tune else 4)
 
@@ -3590,11 +3642,12 @@ def edges_job(img, cfg, contrast):
 def detail_levels(cfg):
     """Increasingly detailed variants of cfg (more colors, finer merging, more edges)."""
     c, m, e = int(cfg["colors"]), float(cfg["merge_de"]), float(cfg["edge_contrast"])
-    return [("more colors", {"colors": min(32, c + 4)}),
-            ("more colors + edges", {"colors": min(32, c + 4), "edge_contrast": max(8.0, e - 5)}),
-            ("many more colors + edges", {"colors": min(32, c + 8), "merge_de": max(4.0, m - 3),
+    top = quality(cfg)["max_colors"]
+    return [("more colors", {"colors": min(top, c + 4)}),
+            ("more colors + edges", {"colors": min(top, c + 4), "edge_contrast": max(8.0, e - 5)}),
+            ("many more colors + edges", {"colors": min(top, c + 8), "merge_de": max(4.0, m - 3),
                                           "edge_contrast": max(8.0, e - 5)}),
-            ("max detail", {"colors": min(32, c + 12), "merge_de": max(3.0, m - 4),
+            ("max detail", {"colors": min(top, c + 12), "merge_de": max(3.0, m - 4),
                             "edge_contrast": max(6.0, e - 8), "smooth": max(0.0, float(cfg["smooth"]) - 0.5)})]
 
 
@@ -3604,7 +3657,7 @@ def upgrade_detail(img, cfg, plan, est, budget, emit=lambda m: None, futs=None):
     budget = usable(budget)
     tl = may_wait(est)
     took = getattr(_SEARCH_TAG, "last_plan_s", None)
-    if est > 0.8 * budget or (tl is not None and tl < 3):
+    if est > 0.8 * budget or (tl is not None and tl < 3) or not quality(cfg)["detail"]:
         return cfg, plan, est, None
     if tl is not None and took and took * 1.2 > tl:
         log(f"detail upgrade skipped: a plan at this size takes ~{took:.0f}s, only {tl:.0f}s of planning left")
@@ -3643,7 +3696,8 @@ def choose_sizes(img, cfg, curve, budget, emit=lambda m: None, prefetched=None):
     d_min, d_max = curve_range(cfg, curve)
     # finest option is the smallest brush itself (the edge pass then switches off: it needs a
     # clearly finer pen); time decides whether that or a bigger fine brush + edges wins
-    lo_d, hi_d = max(3.0, d_min), max(3.0, min(d_max, 30))
+    lo_d, hi_d = fine_range(cfg, d_min, d_max)
+    edges = quality(cfg)["edges"]
     cands = [f for f in FINE_CANDIDATES if lo_d <= f <= hi_d] or [round(min(max(lo_d, 3.0), hi_d), 1)]
     finest = round(min(lo_d, hi_d), 1)
     if finest not in cands:
@@ -3653,7 +3707,7 @@ def choose_sizes(img, cfg, curve, budget, emit=lambda m: None, prefetched=None):
     # steps, the big brush changes with the fine one), so every size is checked - but sizes
     # that end up with the same real brushes give the same plan: plan one of each.
     def brushes(f):
-        c = cfg_with_sizes(cfg, None, *sizes_for(f, d_min, d_max))
+        c = cfg_with_sizes(cfg, None, *sizes_for(f, d_min, d_max, edges))
         return json.dumps({k: c[k] for k in sorted(c) if "brush" in k or k == "spacing"}, default=str)
     groups = {}
     for f in cands:
@@ -3670,7 +3724,7 @@ def choose_sizes(img, cfg, curve, budget, emit=lambda m: None, prefetched=None):
     coarsest = reps[-1]
     for f in reversed(reps):
         if f not in futs:
-            futs[f] = search_submit(_estimate_job, img, cfg, sizes_for(f, d_min, d_max))
+            futs[f] = search_submit(_estimate_job, img, cfg, sizes_for(f, d_min, d_max, edges))
     results, results_t = {}, {}
     waiting = {futs[f]: f for f in reps}
     while waiting:
@@ -3699,7 +3753,7 @@ def choose_sizes(img, cfg, curve, budget, emit=lambda m: None, prefetched=None):
     fits = sorted(f for f, r in results.items() if r[2] <= budget)
     order = fits + sorted((f for f in results if f not in fits), reverse=True)
     for f in order[:3]:  # use the pick if its sizes match reality, else re-plan it exactly
-        sz = sizes_for(f, d_min, d_max)
+        sz = sizes_for(f, d_min, d_max, edges)
         guess_sz, plan, e = results[f]
         same = all((a is None) == (b is None) and (a is None or abs(a - b) <= 0.03 * b)
                    for a, b in zip(guess_sz, sz))
@@ -3836,7 +3890,7 @@ def auto_tune(img, cfg, budget, emit=lambda m: None):
     else:
         base_est = None
     combos = [dict(c, colors=n, smooth=sm, line_art=la)
-              for n in (12, 20, 28) for sm in (0.5, 1.0, 1.5) for la in (True, False)]
+              for n in quality(cfg)["tune_colors"] for sm in (0.5, 1.0, 1.5) for la in ((True, False) if quality(cfg)["edges"] else (False,))]
     # closest to the current settings first: the first batch (one per core) is the likeliest
     # to be all there's time for
     combos.sort(key=lambda cc: (abs(cc["colors"] - int(cfg["colors"])) / 8 + abs(cc["smooth"] - float(cfg["smooth"]))
@@ -4038,6 +4092,9 @@ def _fit_to_time(img, cfg, budget, emit=lambda m: None):
     """Settings + plan that finish within `budget` seconds. Uses the measured brush curve to
     pick brush sizes when available (more time = finer brushes); otherwise trims the edge pass
     and colors. Returns (cfg, plan, est, description)."""
+    cfg = dict(cfg, colors=min(int(cfg["colors"]), quality(cfg)["max_colors"]))
+    if not quality(cfg)["edges"]:
+        cfg.update(line_art=False, tiny_brush_pct=0)
     curve = cfg.get("brush_curve")
     if cfg.get("brush_min") and cfg.get("brush_max") and curve and len(curve) >= 2:
         with deadline_share(0.7):
@@ -4757,6 +4814,20 @@ class App(QWidget):
         self.autotune.setChecked(bool(self.cfg.get("autotune", False)))
         self.autotune.toggled.connect(lambda v: (self.cfg.update(autotune=bool(v)), self.save()))
         bar.addWidget(self.autotune)
+        self.quality_box = QComboBox()
+        for k, q in QUALITY.items():
+            self.quality_box.addItem(q["label"], k)
+            self.quality_box.setItemData(self.quality_box.count() - 1, q["tip"], Qt.ToolTipRole)
+        self.quality_box.setCurrentIndex(max(0, self.quality_box.findData(self.cfg.get("quality", "balanced"))))
+        self.quality_box.setToolTip("Speed vs detail: how small the brushes and how many colors the "
+                                    "planner may use, and how long it may plan")
+
+        def set_quality(_):
+            self.cfg["quality"] = self.quality_box.currentData()
+            log(f"quality set to {quality(self.cfg)['label']}")
+            self.save()
+        self.quality_box.currentIndexChanged.connect(set_quality)
+        bar.addWidget(self.quality_box)
         self.start_btn = QPushButton()
         self.start_btn.setMinimumHeight(34)
         self.start_btn.setStyleSheet("QPushButton { font-weight: 700; font-size: 14px; }")
@@ -5737,8 +5808,10 @@ class App(QWidget):
             # never more than 30% of the time
             span = budget + (plan_s if limit is None else limit)
             _SEARCH_TAG.round_end = time.time() + span
-            _SEARCH_TAG.deadline = time.time() + 0.3 * span
-            log(f"planning: {span:.0f}s for planning + drawing, planning at most {0.3 * span:.0f}s, "
+            share = quality(cfg)["plan_share"]
+            _SEARCH_TAG.deadline = time.time() + share * span
+            log(f"planning: {span:.0f}s for planning + drawing, quality {quality(cfg)['label']}, "
+                f"planning at most {share * span:.0f}s, "
                 f"{'auto-tune' if tune else 'exact settings' if exact else 'fit to time'}")
             t = time.time()
             try:
