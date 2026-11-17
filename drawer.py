@@ -18,8 +18,8 @@ from PySide6.QtCore import QFile, QObject, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame,
                                QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-                               QListView, QListWidget, QListWidgetItem, QMessageBox, QProgressBar,
-                               QPushButton, QScrollArea, QTabWidget, QVBoxLayout, QWidget)
+                               QListView, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
+                               QProgressBar, QPushButton, QScrollArea, QTabWidget, QVBoxLayout, QWidget)
 
 sys.setswitchinterval(0.001)  # keep the drawing thread on time while planning runs alongside
 
@@ -63,6 +63,36 @@ def keep_awake():
         pass
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drawer_log.txt")
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+DEBUG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drawer_debug")  # local only
+_LOG = {"t0": time.time(), "lock": threading.Lock()}
+
+
+def log_reset(title):
+    """Start a fresh drawer_log.txt for a run (Start, Auto speed, ...)."""
+    sink = _LOG.get("sink")
+    if sink:
+        sink(f"=== {title} - {time.strftime('%H:%M:%S')} ===")
+    with _LOG["lock"]:
+        _LOG["t0"] = time.time()
+        try:
+            with open(LOG_PATH, "w") as f:
+                f.write(f"=== {title} - {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        except OSError:
+            pass
+
+
+def log(msg):
+    """One timestamped line in drawer_log.txt, written right away (so a hang shows where)."""
+    line = f"{time.time() - _LOG['t0']:7.1f}s  [{threading.current_thread().name[:10]:10s}]  {msg}\n"
+    sink = _LOG.get("sink")
+    if sink:  # the app's log panel (a Qt signal: safe from any thread)
+        sink(f"{time.time() - _LOG['t0']:6.1f}s  {msg}")
+    with _LOG["lock"]:
+        try:
+            with open(LOG_PATH, "a") as f:
+                f.write(line)
+        except OSError:
+            pass
 LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "library")  # local only (gitignored)
 LIB_EXT = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff")
 
@@ -1823,6 +1853,8 @@ class Drawer:
                 raw_progress(stage, frac, text, hx)
 
         def status_throttled(msg):
+            if not msg.startswith("Step "):
+                log(msg)
             now = time.perf_counter()
             if now - last["s"] > 0.15 or not msg.startswith("Step "):
                 last["s"] = now
@@ -2108,8 +2140,8 @@ class Drawer:
         if self._stage_override:  # correction passes don't overwrite the drawing's log
             return
         try:
-            with open(LOG_PATH, "w") as f:
-                f.write(f"run started {time.strftime('%H:%M:%S', time.localtime(tm['t0']))}  "
+            with _LOG["lock"], open(LOG_PATH, "a") as f:
+                f.write(f"--- drawing summary: run started {time.strftime('%H:%M:%S', time.localtime(tm['t0']))}  "
                         f"event delay {self.cfg['frame_ms']}ms, picker pause {self.cfg.get('picker_ms', 30)}ms, "
                         f"color wait {self.cfg['color_wait_ms']}ms, time factor {self.cfg.get('time_factor') or 1.0:.2f}\n")
                 f.write("step  color   brush   strokes  predicted  actual  (cumulative predicted / actual)\n")
@@ -2213,6 +2245,7 @@ class Drawer:
                 # the background is done: switch to the full plan (wait if it's still planning)
                 pend, self._pending = self._pending, None
                 w0 = time.time()
+                log("background drawn; " + ("plan ready" if pend.ready.is_set() else "waiting for the plan"))
                 if not pend.ready.is_set():
                     self.status("Background done; waiting for the plan to finish...")
                     self.progress("plan", -1, "finishing the plan...", "")
@@ -2220,6 +2253,7 @@ class Drawer:
                 while not pend.ready.wait(0.1):
                     self.check()
                 start += time.time() - w0  # waiting isn't slow drawing
+                log(f"waited {time.time() - w0:.1f}s for the plan")
                 if pend.result is not None:
                     self.cfg, new, desc = pend.result
                     new = [st for st in new if not (st[1] == "bucket" and bucketed)]
@@ -2349,6 +2383,9 @@ class Drawer:
             step_t0 = time.perf_counter()
             step_comp = step_components(self.cfg, (hexstr, size, strokes), getattr(self, "_prev_step", None))
             step_pred = sum(step_comp)
+            log(f"step {ci}: #{hexstr} {size}, {len(strokes)} strokes, predicted {step_pred:.1f}s, "
+                f"delay {self.frame * 1000:.1f}ms" + (f", {self.deadline - time.time():.0f}s to deadline"
+                                                      if self.deadline else ""))
             if size == "bucket":
                 if done == 0 and not bucketed:  # only on a blank canvas (a re-plan mid-drawing
                     self.set_color(hexstr)      # would flood over what's drawn)
@@ -2381,6 +2418,7 @@ class Drawer:
                     self.status(f"Time's up: stopped after {done} strokes")
                     return
             dt = time.perf_counter() - step_t0
+            log(f"step {ci} done in {dt:.1f}s ({dt / max(0.05, step_pred):.2f}x predicted)")
             self._timing["pred"] += step_pred
             self._timing["act"] += dt
             self._timing["rows"].append((ci, hexstr, size, len(strokes), step_pred, dt))
@@ -2755,6 +2793,17 @@ class Drawer:
         coverage = dark[core].mean() if core.any() else 0.0
         stray = int((dark & ~near).sum())
         ok = coverage >= 0.97 and stray <= (b * sc) ** 2 * 1.5
+        if not ok:  # keep what was seen next to what was expected, for the log
+            try:
+                os.makedirs(DEBUG_DIR, exist_ok=True)
+                path = os.path.join(DEBUG_DIR, f"autospeed_{time.strftime('%H%M%S')}.png")
+                want = np.where(core[..., None], [255, 0, 0], np.where(near[..., None], [255, 220, 220], [255, 255, 255]))
+                pair = np.concatenate([np.clip(img, 0, 255), want], axis=1).astype(np.uint8)
+                cv2.imwrite(path, cv2.cvtColor(pair, cv2.COLOR_RGB2BGR))
+                log(f"auto speed: failed test saved to {path} (left: screenshot, right: expected "
+                    f"ink in red); brush {b:.1f}pt, ink found in {dark.mean():.1%} of the spot")
+            except Exception:
+                pass
         return ok, coverage, stray
 
     def _color_check(self, ox, oy, b):
@@ -2847,11 +2896,33 @@ class Drawer:
             self.t = time.perf_counter()
         return clean
 
+    def _speed_test_brush(self, cfg):
+        """A mid-size brush (~8pt) for the speed tests: the smallest sizes' measured widths
+        aren't reliable enough to check coverage against. Returns (set_brush arg or None, pt)."""
+        target = 8.0
+        ac = [(n, d) for n, d in (cfg.get("arrow_curve") or []) if d <= 14]
+        if has_arrows(cfg) and ac:
+            n, d = min(ac, key=lambda nd: abs(nd[1] - target))
+            return ("clicks", int(n)), float(d)
+        curve = cfg.get("brush_curve")
+        if cfg.get("brush_min") and cfg.get("brush_max") and curve and len(curve) >= 2:
+            p, d = min(sorted(curve), key=lambda pd: abs(pd[1] - target))
+            return p, float(d)
+        return None, float(cfg.get("brush_pt") or cfg["spacing"] / 0.9)
+
+    def _canvas_ink(self, cfg):
+        """Fraction of the canvas that isn't white (None if the screenshot failed)."""
+        tl, br = cfg["canvas_tl"], cfg["canvas_br"]
+        self.park()
+        time.sleep(0.3)
+        cap = capture(tl[0] + 2, tl[1] + 2, br[0] - tl[0] - 4, br[1] - tl[1] - 4)
+        return None if cap is None else float((cap[0].astype(np.int16).min(2) < 200).mean())
+
     def auto_speed(self):
         """Try ever faster timing on test patterns, keep the fastest that draws correctly.
         Returns (settings dict, log lines)."""
         base = dict(self.cfg)
-        b = float(base.get("brush_pt") or base["spacing"] / 0.9)
+        brush_arg, b = self._speed_test_brush(base)
         tl, br = base["canvas_tl"], base["canvas_br"]
         length = max(40.0, min(150.0, (br[0] - tl[0] - 20 - 2 * b) / 1.35))  # fit narrow canvases
         w, h = length * 1.33 + 2 * b, 16 * b
@@ -2859,7 +2930,11 @@ class Drawer:
                  for x in np.arange(tl[0] + 5, br[0] - w, w + 8)]
         if not slots:
             raise RuntimeError("Canvas too small for speed tests - calibrate the canvas corners again")
-        log = []
+        lines = []
+
+        def note_line(m):
+            lines.append(m)
+            log("auto speed: " + m)
         cur = {k: base[k] for k in ("frame_ms", "corner_frames", "segment", "color_wait_ms")}
         room = {"left": iter(slots), "used": [], "safe": dict(cur), "wipes": 0}
 
@@ -2871,11 +2946,11 @@ class Drawer:
             if pos is None and room["used"]:
                 if room["wipes"] >= 20 or not self._wipe_slots(room["used"], w, h, b, dict(base, **room["safe"])):
                     room["full"] = True
-                    log.append("out of canvas room (couldn't paint the tests over): stopped early - "
+                    note_line("out of canvas room (couldn't paint the tests over): stopped early - "
                                "clear the canvas and run again to test faster settings")
                     return None
                 room["wipes"] += 1
-                log.append("small canvas: painted the tests over to reuse the space")
+                note_line("small canvas: painted the tests over to reuse the space")
                 room["left"], room["used"] = iter(slots), []
                 pos = next(room["left"], None)
             if pos is not None:
@@ -2906,7 +2981,7 @@ class Drawer:
                                        "this script (System Settings > Privacy & Security), restart it, retry.")
                 ok = res[0]
                 msg = f"coverage {res[1]:.0%}, stray ink {res[2]}px"
-            log.append(f"{label}: {'PASS' if ok else 'fail'} ({msg})")
+            note_line(f"{label}: {'PASS' if ok else 'fail'} ({msg})")
             self.status(f"Auto speed - {label}: {'pass' if ok else 'fail'}")
             if ok:
                 cur.update(chg)
@@ -2922,9 +2997,22 @@ class Drawer:
             return r
 
         self.activate()
+        ink = self._canvas_ink(base)
+        log(f"auto speed: test brush {b:.1f}pt ({brush_arg}), canvas {0 if ink is None else ink:.1%} not white")
+        if ink is not None and ink > 0.002:
+            # leftovers (e.g. the last drawing's background) hide the black test ink
+            if not (base.get("bucket_tool") and base.get("brush_tool")):
+                raise RuntimeError(f"The canvas isn't blank ({ink:.0%} has paint on it): clear it and run Auto speed again")
+            self.status("Auto speed: clearing the canvas first")
+            tl, br = base["canvas_tl"], base["canvas_br"]
+            self._wipe_slots([(tl[0] + 3, tl[1] + 3)], br[0] - tl[0] - 8, br[1] - tl[1] - 8, b, base)
+            ink = self._canvas_ink(base)
+            log(f"auto speed: after clearing, {0 if ink is None else ink:.1%} not white")
+            if ink is not None and ink > 0.002:
+                raise RuntimeError(f"Couldn't clear the canvas ({ink:.0%} still has paint): clear it and run Auto speed again")
         self.set_color("000000")
-        if self.cfg.get("brush_min") and self.cfg.get("brush_max"):
-            self.set_brush(base["brush_pct"])
+        if brush_arg is not None:
+            self.set_brush(brush_arg)
         interpolates = True
         if not trial2(f"current settings ({cur['frame_ms']}ms)"):
             # maybe the game only paints where the mouse is sampled: try many points per row
@@ -2949,7 +3037,7 @@ class Drawer:
                 break
             passed.pop()
             cur["frame_ms"] = passed[-1]
-            log.append(f"{f}ms is flaky: backing off to {cur['frame_ms']}ms")
+            note_line(f"{f}ms is flaky: backing off to {cur['frame_ms']}ms")
         self.set_color("000000")
         for cw in (150, 100, 60, 30):
             if cw < cur["color_wait_ms"]:
@@ -2965,7 +3053,7 @@ class Drawer:
             result["frame_ms"] = int(min(base["frame_ms"], math.ceil(cur["frame_ms"] * 1.15)))
         else:
             result["frame_ms"] = int(base["frame_ms"])
-        return result, log
+        return result, lines
 
     def speed_test(self):
         """Draw a zigzag + long lines in the canvas top-left with the current color and
@@ -3327,6 +3415,48 @@ def search_submit(fn, *args):
     return f
 
 
+def time_left():
+    """Seconds until this thread's planning deadline (None = no deadline). Searches stop
+    there and use the best result found so far."""
+    d = getattr(_SEARCH_TAG, "deadline", None)
+    return None if d is None else d - time.time()
+
+
+def may_wait(best_est=None):
+    """Seconds this thread's search may still wait for something better (None = no limit).
+    Bounded by the hard planning deadline and, with a round end set, by the best usable
+    plan so far: it must still fit the time left after planning, with a 25% margin."""
+    tl = time_left()
+    end = getattr(_SEARCH_TAG, "round_end", None)
+    if end is not None and best_est is not None:
+        dyn = (end - time.time()) - (best_est + 3) / 0.75
+        tl = dyn if tl is None else min(tl, dyn)
+    return tl
+
+
+def usable(budget):
+    """Drawing budget left if planning stopped now (planning that ran long eats into it)."""
+    end = getattr(_SEARCH_TAG, "round_end", None)
+    return budget if end is None else min(budget, end - time.time() - 2)
+
+
+class deadline_share:
+    """Within the block, this thread's planning deadline is `share` of the time left (so a
+    first step can't use it all up); restored afterwards."""
+
+    def __init__(self, share):
+        self.share = share
+
+    def __enter__(self):
+        self.saved = getattr(_SEARCH_TAG, "deadline", None)
+        tl = time_left()
+        if tl is not None:
+            _SEARCH_TAG.deadline = time.time() + max(0.0, tl) * self.share
+
+    def __exit__(self, *exc):
+        _SEARCH_TAG.deadline = self.saved
+
+
 def cancel_searches(tag):
     """Cancel the queued (not yet running) jobs of searches started under `tag`, so a newer
     search doesn't wait behind ones nobody needs any more."""
@@ -3471,22 +3601,36 @@ def detail_levels(cfg):
 def upgrade_detail(img, cfg, plan, est, budget, emit=lambda m: None, futs=None):
     """If the plan leaves lots of time unused, plan richer variants in parallel and return
     the most detailed one that still fits: (cfg, plan, est, description or None)."""
-    if est > 0.8 * budget:
+    budget = usable(budget)
+    tl = may_wait(est)
+    took = getattr(_SEARCH_TAG, "last_plan_s", None)
+    if est > 0.8 * budget or (tl is not None and tl < 3):
+        return cfg, plan, est, None
+    if tl is not None and took and took * 1.2 > tl:
+        log(f"detail upgrade skipped: a plan at this size takes ~{took:.0f}s, only {tl:.0f}s of planning left")
         return cfg, plan, est, None
     levels = detail_levels(cfg)
     emit(f"Plan needs ~{est:.0f}s of {budget:.0f}s: trying {len(levels)} more detailed versions...")
+    log(f"detail upgrade: plan {est:.0f}s of {budget:.0f}s, trying {len(levels)} richer versions"
+        + (f", up to {tl:.0f}s" if tl is not None else ""))
     futs = futs or [(desc, dict(cfg, **chg), search_submit(_plan_job, img, dict(cfg, **chg))) for desc, chg in levels]
     end = PLAN_METER.expect(len(futs))
     try:
-        for n, (desc, c, f) in enumerate(reversed(futs)):  # most detailed first: stop at the first that fits
-            p, e = f.result()
-            PLAN_METER.tick()
-            if e <= budget:
-                for _, _, other in futs[:len(futs) - 1 - n]:
-                    other.cancel()
-                return c, p, e, desc
+        import concurrent.futures as cf
+        cf.wait([f for _, _, f in futs], timeout=None if tl is None else max(0.0, tl))
+        budget = usable(budget)
+        for desc, c, f in reversed(futs):  # most detailed first: the first that's done and fits
+            if f.done() and not f.cancelled() and f.exception() is None:
+                p, e = f.result()
+                log(f"  {desc}: {e:.0f}s" + (" -> use" if e <= budget else " (too long)"))
+                if e <= budget:
+                    return c, p, e, desc
+            else:
+                log(f"  {desc}: not done in time")
         return cfg, plan, est, None
     finally:
+        for _, _, f in futs:
+            f.cancel()
         PLAN_METER.settle(end)
 
 
@@ -3517,26 +3661,41 @@ def choose_sizes(img, cfg, curve, budget, emit=lambda m: None, prefetched=None):
     reps = sorted(min(g) for g in groups.values())  # the finest size of each group
     futs = dict(prefetched or {})
     emit(f"Planning {len(reps)} distinct brush sizes in parallel...")
+    log(f"brush search: {len(cands)} sizes -> {len(reps)} distinct brush sets {reps}, drawing budget "
+        f"{budget:.0f}s, planning limit " + (f"{may_wait():.0f}s" if may_wait() is not None else "none"))
+    t_cs = time.time()
     end = PLAN_METER.expect(len(reps) + 1)
-    # the coarsest first (quick, and if even it's too slow nothing fits), then finest first:
-    # the finest take longest, so starting them early finishes the batch sooner
+    # coarsest first: quick, and if even it's too slow nothing fits; then ever finer, so at
+    # the planning deadline the finest size planned so far is used
     coarsest = reps[-1]
-    for f in [coarsest] + reps[:-1]:
+    for f in reversed(reps):
         if f not in futs:
             futs[f] = search_submit(_estimate_job, img, cfg, sizes_for(f, d_min, d_max))
-    results = {}
+    results, results_t = {}, {}
     waiting = {futs[f]: f for f in reps}
     while waiting:
-        done, _ = cf.wait(list(waiting), return_when=cf.FIRST_COMPLETED)
+        ub = usable(budget)
+        fit = [r[2] for f, r in sorted(results.items()) if r[2] <= ub]
+        tl = may_wait(fit[0] if fit else None)
+        if results and tl is not None and tl <= 0:
+            emit(f"Planning time's up: using the best of {len(results)} brush sizes planned")
+            log(f"  stop waiting: {len(results)}/{len(reps)} planned, {len(waiting)} dropped (time)")
+            break
+        done, _ = cf.wait(list(waiting), return_when=cf.FIRST_COMPLETED,
+                          timeout=None if tl is None or not results else max(0.0, tl))
         for fut in done:
             f = waiting.pop(fut)
             results[f] = fut.result()
             PLAN_METER.tick()
+            results_t[f] = time.time() - t_cs
+            log(f"  fine {f}pt planned: draws in {results[f][2]:.0f}s (+{results_t[f]:.1f}s)")
         if coarsest in results and results[coarsest][2] > budget:
+            log("  even the biggest brush is over budget: stop")
             break  # the fastest size is already too slow
     for f, fut in futs.items():
         if f not in results:
             fut.cancel()
+    budget = usable(budget)
     fits = sorted(f for f, r in results.items() if r[2] <= budget)
     order = fits + sorted((f for f in results if f not in fits), reverse=True)
     for f in order[:3]:  # use the pick if its sizes match reality, else re-plan it exactly
@@ -3548,6 +3707,8 @@ def choose_sizes(img, cfg, curve, budget, emit=lambda m: None, prefetched=None):
         if not same:
             plan, e = plan_for(img, c)
         emit(f"Planning: fine brush {f:.1f}pt -> ~{e:.0f}s")
+        log(f"  pick fine {f}pt: {e:.0f}s of {budget:.0f}s" + ("" if same else " (re-planned exactly)"))
+        _SEARCH_TAG.last_plan_s = results_t.get(f)  # how long a plan at this size takes
         if e <= budget:
             break
     PLAN_METER.settle(end)
@@ -3599,6 +3760,11 @@ def source_on_canvas(img, cfg, shape):
 def _quality_job(img, cfg):
     """(look error, predicted seconds) for one candidate: average color difference between
     the rendered drawing and the original (lower = looks more like the picture)."""
+    return _quality_plan_job(img, cfg)[:2]
+
+
+def _quality_plan_job(img, cfg):
+    """(look error, predicted seconds, plan) - see _quality_job."""
     plan, est = plan_for(img, cfg)
     tl, br, sp = cfg["canvas_tl"], cfg["canvas_br"], cfg["spacing"]
     shape = (int((br[1] - tl[1]) / sp) * HS, int((br[0] - tl[0]) / sp) * HS, 3)
@@ -3615,7 +3781,7 @@ def _quality_job(img, cfg):
     b = cv2.resize(b, (b.shape[1] // 2, b.shape[0] // 2), interpolation=cv2.INTER_AREA)
     la = _to_lab(a.reshape(-1, 3).astype(np.float64))
     lb = _to_lab(b.reshape(-1, 3).astype(np.float64))
-    return float(np.sqrt(((la - lb) ** 2).sum(1)).mean()), est
+    return float(np.sqrt(((la - lb) ** 2).sum(1)).mean()), est, plan
 
 
 AUTO_SETTINGS = [  # setting, values to try (in this order, one setting at a time)
@@ -3665,23 +3831,54 @@ def auto_tune(img, cfg, budget, emit=lambda m: None):
     curve = c.get("brush_curve")
     if curve and len(curve) >= 2 and ((c.get("brush_min") and c.get("brush_max")) or has_arrows(c)):
         emit("Auto-tune: picking brush sizes...")
-        c, _, _, _ = choose_sizes(img, c, curve, budget, emit)
+        with deadline_share(0.45):
+            c, _, base_est, _ = choose_sizes(img, c, curve, budget, emit)
+    else:
+        base_est = None
     combos = [dict(c, colors=n, smooth=sm, line_art=la)
               for n in (12, 20, 28) for sm in (0.5, 1.0, 1.5) for la in (True, False)]
+    # closest to the current settings first: the first batch (one per core) is the likeliest
+    # to be all there's time for
+    combos.sort(key=lambda cc: (abs(cc["colors"] - int(cfg["colors"])) / 8 + abs(cc["smooth"] - float(cfg["smooth"]))
+                                + 0.5 * (cc["line_art"] != bool(cfg.get("line_art", True)))))
     emit(f"Auto-tune: trying {len(combos)} setting combinations...")
-    futs = [(cc, search_submit(_quality_job, img, cc)) for cc in combos]
+    log(f"auto-tune: {len(combos)} combinations at fine {c.get('brush_pt')}pt, budget {budget:.0f}s"
+        + (f", up to {may_wait(base_est):.0f}s" if may_wait(base_est) is not None else ""))
+    t_at = time.time()
+    futs = [(cc, search_submit(_quality_plan_job, img, cc)) for cc in combos]
     end = PLAN_METER.expect(len(futs) + 1)
-    scored = []
-    for cc, f in futs:
-        try:
-            err, est = f.result()
-            scored.append((err, est, cc))
-        except Exception:
-            pass
-        PLAN_METER.tick()
+    import concurrent.futures as cf
+    pending, scored = {f: cc for cc, f in futs}, []
+    while pending:
+        ub = usable(budget)
+        best = min((t[1] for t in scored if t[1] <= ub), default=base_est)
+        tl = may_wait(best)
+        if tl is not None and tl <= 0 and (scored or best is not None):
+            break
+        done, _ = cf.wait(list(pending), return_when=cf.FIRST_COMPLETED,
+                          timeout=None if tl is None else max(0.0, tl))
+        for f in done:
+            cc = pending.pop(f)
+            if f.exception() is None:
+                err, est, plan = f.result()
+                scored.append((err, est, cc, plan))
+                log(f"  colors {cc['colors']}, smooth {cc['smooth']}, line art {cc['line_art']}: "
+                    f"look error {err:.2f}, {est:.0f}s (+{time.time() - t_at:.1f}s)")
+            else:
+                log(f"  combination failed: {f.exception()!r}")
+            PLAN_METER.tick()
+    for f in pending:
+        f.cancel()
+    if pending:
+        log(f"  stop waiting: {len(scored)}/{len(futs)} combinations done (time)")
+    budget = usable(budget)
+    if len(scored) < len(futs):
+        emit(f"Auto-tune: planning time's up, picking from {len(scored)} of {len(futs)} combinations")
+    if not scored:  # nothing finished in time: the brush pick with the current settings
+        p, e = plan_for(img, c)
+        scored = [(0.0, e, c, p)]
     fits = [t for t in scored if t[1] <= budget]
-    err, est, best = min(fits, key=lambda t: t[0]) if fits else min(scored, key=lambda t: t[1])
-    plan, est = plan_for(img, best)
+    err, est, best, plan = min(fits, key=lambda t: t[0]) if fits else min(scored, key=lambda t: t[1])
     PLAN_METER.settle(end)
     if est > budget:  # nothing fit: simplify the best-looking pick until it does
         emit("Auto-tune: no combination fits the time, simplifying...")
@@ -3715,14 +3912,29 @@ def fit_to_time(img, cfg, budget, emit=lambda m: None):
 PLAN_DIR = os.path.join(LIB_DIR, ".plans")
 # settings that don't change the plan itself: a stored plan stays valid when only these change
 PLAN_FREE_KEYS = {"time_limit", "time_factor", "timing_model", "game_rate", "correct_passes", "autotune",
-                  "auto_settings_for", "timer_tl", "timer_br", "focus_spot", "key_ms"}
+                  "auto_settings_for", "timer_tl", "timer_br", "focus_spot", "key_ms",
+                  # mouse timing and color picker: change how fast / how colors are set, not the
+                  # strokes (a stored plan's time is re-estimated with the current values)
+                  "show_log", "frame_ms", "min_frame_ms", "corner_frames", "segment", "color_wait_ms", "picker_ms",
+                  "picker", "hex_box", "hash_prefix", "value_curve", "value_top", "value_bottom",
+                  "ring_center", "ring_point", "square_tl", "square_br", "wheel_center", "wheel_edge"}
+PLANS_PER_PICTURE = 6  # plans for other settings are kept (switching a setting back reuses them)
+
+
+def plan_settings(cfg):
+    """The settings a plan depends on (brushes, colors, canvas, image settings)."""
+    return {k: cfg[k] for k in sorted(cfg) if k not in PLAN_FREE_KEYS and not k.startswith("_")}
 
 
 def plan_settings_key(cfg):
-    """Everything a plan depends on (brushes, colors, canvas, image and timing settings)."""
     import hashlib
-    keep = {k: cfg[k] for k in sorted(cfg) if k not in PLAN_FREE_KEYS and not k.startswith("_")}
-    return hashlib.md5(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest()
+    return hashlib.md5(json.dumps(plan_settings(cfg), sort_keys=True, default=str).encode()).hexdigest()
+
+
+def settings_diff(old, new):
+    """Names of the plan settings that differ (for 'pre-plan not used: ... changed')."""
+    keys = sorted(set(old) | set(new))
+    return [k for k in keys if json.dumps(old.get(k), default=str) != json.dumps(new.get(k), default=str)]
 
 
 def picture_id(img):
@@ -3758,51 +3970,68 @@ def _index_set(pid, entries):
         pass
 
 
-def load_preplans(img, cfg):
-    """Stored plans for this picture still valid for cfg: [{"window", "tune", "est", "result"}].
-    Plans made with other settings are dropped from the file."""
+def _load_all_preplans(img):
     import pickle
-    path = _plan_file(img)
     try:
-        with open(path, "rb") as f:
-            entries = pickle.load(f)
+        with open(_plan_file(img), "rb") as f:
+            return pickle.load(f)
     except (OSError, EOFError, pickle.UnpicklingError, AttributeError, ImportError):
         return []
+
+
+def load_preplans(img, cfg):
+    """Stored plans for this picture valid for cfg: [{"window", "tune", "est", "result"}]. Plans
+    made with other settings stay stored (they're used again if the settings go back)."""
     key = plan_settings_key(cfg)
-    good = [e for e in entries if e.get("key") == key]
-    if len(good) != len(entries):
-        try:
-            if good:
-                with open(path, "wb") as f:
-                    pickle.dump(good, f)
-            else:
-                os.remove(path)
-        except OSError:
-            pass
-        _index_set(os.path.basename(path)[:-4], good)
-    return good
+    return [e for e in _load_all_preplans(img) if e.get("key") == key]
 
 
 def save_preplan(img, cfg, window, tune, result):
     """Keep one plan per (window, auto-tune) for this picture."""
     import pickle
     os.makedirs(PLAN_DIR, exist_ok=True)
-    entries = [e for e in load_preplans(img, cfg) if not (e["window"] == window and e["tune"] == tune)]
-    entries.append({"key": plan_settings_key(cfg), "window": window, "tune": tune, "est": result[2],
-                    "result": result, "made": time.time()})
+    key = plan_settings_key(cfg)
+    entries = [e for e in _load_all_preplans(img)
+               if not (e.get("key") == key and e["window"] == window and e["tune"] == tune)]
+    entries.append({"key": key, "settings": plan_settings(cfg), "window": window, "tune": tune,
+                    "est": result[2], "result": result, "made": time.time()})
+    entries = sorted(entries, key=lambda e: e.get("made", 0))[-PLANS_PER_PICTURE:]
     with open(_plan_file(img), "wb") as f:
         pickle.dump(entries, f)
     _index_set(picture_id(img), entries)
 
 
-def pick_preplan(img, cfg, tune, avail):
-    """The most detailed stored plan that fits `avail` drawing seconds: (cfg, plan, est, desc) or None."""
-    fits = [e for e in load_preplans(img, cfg) if e["tune"] == tune and e["est"] <= avail]
-    if not fits:
-        return None
-    c, plan, est, desc = max(fits, key=lambda e: e["est"])["result"]
-    c = dict(c, **{k: cfg[k] for k in PLAN_FREE_KEYS if k in cfg})  # current timer/calibration extras
-    return c, plan, est, desc
+def pick_preplan(img, cfg, tune, avail, why=None):
+    """The most detailed stored plan that fits `avail` drawing seconds: (cfg, plan, est, desc) or
+    None. Times are re-estimated with the current mouse timing. why: list that gets the reason
+    when stored plans exist but none is used."""
+    every = _load_all_preplans(img)
+    key = plan_settings_key(cfg)
+    fits, other = [], []
+    for e in every:
+        if e.get("key") != key:
+            other.append(e)
+            continue
+        c, plan, est, desc = e["result"]
+        c = dict(c, **{k: cfg[k] for k in PLAN_FREE_KEYS if k in cfg})  # current timing/calibration
+        est = estimate_seconds(plan, c)
+        log(f"pre-plan for {e['window']}s{' (auto-tune)' if e['tune'] else ''}: ~{est:.0f}s now, "
+            f"{avail:.0f}s available" + ("" if e["tune"] == tune else " - auto-tune setting differs"))
+        if e["tune"] == tune and est <= avail:
+            fits.append((est, (c, plan, est, desc)))
+    if fits:
+        return max(fits, key=lambda t: t[0])[1]
+    if why is not None and every:
+        if other and len(other) == len(every):
+            now = plan_settings(cfg)
+            ch = sorted({k for e in other for k in settings_diff(e.get("settings") or {}, now)}
+                        if all(e.get("settings") for e in other) else set())
+            why.append("settings changed since pre-planning" + (f" ({', '.join(ch[:5])})" if ch else ""))
+        else:
+            why.append("stored plans don't fit the time left" + ("" if any(e["tune"] == tune for e in every)
+                                                                    else " / were made with a different auto-tune setting"))
+        log("pre-plan not used: " + why[-1])
+    return None
 
 
 def _fit_to_time(img, cfg, budget, emit=lambda m: None):
@@ -3811,7 +4040,8 @@ def _fit_to_time(img, cfg, budget, emit=lambda m: None):
     and colors. Returns (cfg, plan, est, description)."""
     curve = cfg.get("brush_curve")
     if cfg.get("brush_min") and cfg.get("brush_max") and curve and len(curve) >= 2:
-        c, plan, est, (fine, big, tiny) = choose_sizes(img, cfg, curve, budget, emit)
+        with deadline_share(0.7):
+            c, plan, est, (fine, big, tiny) = choose_sizes(img, cfg, curve, budget, emit)
         desc = f"fine {fine:.1f}pt" + (f", big {big:.0f}pt" if big else "") + (f", tiny {tiny:.1f}pt" if tiny else "")
         if est <= budget:
             c, plan, est, more = upgrade_detail(img, c, plan, est, budget, emit)
@@ -4081,6 +4311,7 @@ class Bridge(QObject):
     preview_done = Signal(int, object)
     lib_scored = Signal(str, object)
     lib_planned = Signal(str, object)
+    log_line = Signal(str)
 
 
 class ClickCatcher(QObject):
@@ -4479,9 +4710,40 @@ class App(QWidget):
         tabs.addTab(self.scrolled(st), "Settings")
         self.update_picker_rows()
 
-        # --- always visible: progress (while drawing), start row, status
+        # --- always visible: progress (while drawing), live log, start row, status
         self.progress_panel = ProgressPanel()
         root.addWidget(self.progress_panel)
+        log_head = QHBoxLayout()
+        self.log_toggle = QPushButton()
+        self.log_toggle.setCheckable(True)
+        self.log_toggle.setFlat(True)
+        self.log_toggle.setStyleSheet("QPushButton { text-align: left; font-weight: 600; }")
+        log_head.addWidget(self.log_toggle)
+        log_head.addStretch(1)
+        open_log = QPushButton("Open log file")
+        open_log.setFlat(True)
+        open_log.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(LOG_PATH)))
+        log_head.addWidget(open_log)
+        root.addLayout(log_head)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(3000)
+        self.log_view.setFixedHeight(170)
+        self.log_view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.log_view.setStyleSheet("QPlainTextEdit { font-family: Menlo, monospace; font-size: 11px; }")
+        root.addWidget(self.log_view)
+
+        def show_log(on):
+            self.log_view.setVisible(on)
+            self.log_toggle.setText(("\u25be" if on else "\u25b8") + " What's happening")
+            if self.cfg.get("show_log", True) != on:
+                self.cfg["show_log"] = on
+                self.save()
+        self.log_toggle.toggled.connect(show_log)
+        self.log_toggle.setChecked(bool(self.cfg.get("show_log", True)))
+        show_log(self.log_toggle.isChecked())
+        self.bridge.log_line.connect(self.add_log_line)
+        _LOG["sink"] = self.bridge.log_line.emit
         bar = QHBoxLayout()
         bar.addWidget(QLabel("Time left:"))
         self.time_left = QLineEdit()
@@ -4631,6 +4893,24 @@ class App(QWidget):
     def set_status_main(self, text):
         self.status_label.setText(text)
 
+    LOG_WARN = ("not used", "skipped", "late", "stop waiting", "dropped", "not done in time", "fail",
+                "time's up", "aborted", "slower", "waiting for the plan", "over budget", "isn't blank")
+
+    def add_log_line(self, line):
+        """Live log panel: warnings orange, errors red; stays scrolled to the end unless the
+        user scrolled up to read."""
+        import html
+        sb = self.log_view.verticalScrollBar()
+        at_end = sb.value() >= sb.maximum() - 4
+        low = line.lower()
+        color = ("#dc2626" if ("error" in low or "traceback" in low) else
+                 "#d97706" if any(w in low for w in self.LOG_WARN) else
+                 "#2563eb" if line.startswith("===") else None)
+        text = html.escape(line).replace(" ", "&nbsp;").replace("\n", "<br>")
+        self.log_view.appendHtml(f'<span style="color:{color}">{text}</span>' if color else text)
+        if at_end:
+            sb.setValue(sb.maximum())
+
     def error(self, msg):
         QMessageBox.critical(self, "Error", msg)
 
@@ -4748,6 +5028,8 @@ class App(QWidget):
                 sub += "\npre-planning..."
             elif windows:
                 sub += "\n\u2713 planned " + ", ".join(f"{w}s" for w in windows)
+            elif pidx.get(icon[2]):
+                sub += "\nplanned (other settings)"
             it = QListWidgetItem(icon[1], f"{name[:18]}\n{sub}")
             it.setData(Qt.UserRole, p)
             it.setToolTip(f"{os.path.basename(p)}\n{sub}" + ("\n\u26a0 takes longer than the time limit with "
@@ -5302,22 +5584,20 @@ class App(QWidget):
         self._pv_timer.stop()
 
         def job(d):
-            res, log = d.auto_speed()
-            self.bridge.speed_done.emit(res, log)
-        self.launch(job)
+            res, lines = d.auto_speed()
+            self.bridge.speed_done.emit(res, lines)
+        self.launch(job, title="Auto speed")
 
-    def apply_auto_speed(self, res, log):
+    def apply_auto_speed(self, res, lines):
         before = {k: self.cfg[k] for k in res}
         for k in ("frame_ms", "min_frame_ms", "corner_frames", "segment", "color_wait_ms"):
             self.edits[k][0].setText(str(res[k]))
         self.read_settings()
         changed = ", ".join(f"{k} {before[k]} -> {res[k]}" for k in res if before[k] != res[k]) or "no faster settings passed"
-        try:
-            with open(LOG_PATH, "w") as f:
-                f.write("Auto speed: " + changed + "\n" + "\n".join(log) + "\n")
-        except OSError:
-            pass
-        self.set_status_main("Auto speed: " + changed + ". Clear the canvas. | " + " | ".join(log))
+        for line in lines:
+            log("auto speed: " + line)
+        log("auto speed result: " + changed)
+        self.set_status_main("Auto speed: " + changed + ". Clear the canvas. | " + " | ".join(lines))
 
     def apply_auto_brush(self, res):
         self.cfg["brush_curve"] = res.get("curve")  # reused by "Time left" fitting
@@ -5429,6 +5709,9 @@ class App(QWidget):
             self.error(str(e))
             return
         clicked = time.time()
+        cancel_searches("preview")  # a preview still searching would slow Start's planning
+        self._pv_done = self._preview_gen
+        self._pv_timer.stop()
         cfg = dict(self.cfg)
         state = {}
         rate = float(cfg.get("game_rate") or 1.0) if left else 1.0  # game seconds per real second
@@ -5444,7 +5727,29 @@ class App(QWidget):
         curve = cfg.get("brush_curve")
         early = bool(curve and len(curve) >= 2 and ((cfg.get("brush_min") and cfg.get("brush_max")) or has_arrows(cfg)))
 
-        def plan_full(note, budget, base):
+        # planning gets a fixed share of the round, then uses the best it has found: a long
+        # search must never eat the drawing time
+        plan_s = max(6.0, min(40.0 if tune else 25.0, (0.25 if tune else 0.18) * left_for_drawing()))
+
+        def plan_full(note, budget, base, limit=None):
+            # the plan's drawing starts when planning ends: both must fit before the round ends;
+            # planning may take longer than plan_s while the best plan so far still fits, but
+            # never more than 30% of the time
+            span = budget + (plan_s if limit is None else limit)
+            _SEARCH_TAG.round_end = time.time() + span
+            _SEARCH_TAG.deadline = time.time() + 0.3 * span
+            log(f"planning: {span:.0f}s for planning + drawing, planning at most {0.3 * span:.0f}s, "
+                f"{'auto-tune' if tune else 'exact settings' if exact else 'fit to time'}")
+            t = time.time()
+            try:
+                res = _plan_full(note, budget, base)
+                log(f"plan ready after {time.time() - t:.1f}s: {res[3]}, draws in ~{res[2]:.0f}s, "
+                    f"{_SEARCH_TAG.round_end - time.time():.0f}s left for it")
+                return res
+            finally:
+                _SEARCH_TAG.deadline = _SEARCH_TAG.round_end = None
+
+        def _plan_full(note, budget, base):
             say = lambda m: note.update(msg=m)
             if tune:
                 c, plan, est, desc = auto_tune(img, base, 0.93 * budget, say)
@@ -5463,18 +5768,24 @@ class App(QWidget):
 
         def prepare(note):
             budget = left_for_drawing()
-            hit = None if exact else pick_preplan(img, cfg, tune, budget)
+            log(f"Start: round time {total:.0f}s" + (f" (timer read '{left}', game rate {rate})" if left else
+                                                     " (time limit)") + f", {budget:.0f}s for planning + drawing")
+            why = []
+            hit = None if exact else pick_preplan(img, cfg, tune, budget, why)
+            if why:
+                note["msg"] = f"pre-plan not used: {why[0]} - planning now"
             if hit:  # planned ahead (Library > Pre-plan): draw right away
                 PLAN_METER.reset(1)
                 PLAN_METER.tick()
                 c, plan, est, desc = hit
+                log(f"using pre-plan: {desc}, ~{est:.0f}s")
                 note["planned"] = True
                 state["plan"] = plan
                 note["msg"] = f"pre-planned: {desc}, ~{est:.0f}s of {budget:.0f}s"
                 return c
             PLAN_METER.reset(2 if exact else search_guess(cfg, tune))
-            if not early:
-                c, plan, est, desc = plan_full(note, budget, cfg)
+            if not early:  # planning then drawing, both within `budget`
+                c, plan, est, desc = plan_full(note, budget, cfg, limit=0.0)
                 note["planned"] = True
                 remaining = left_for_drawing()
                 state["plan"] = plan
@@ -5496,6 +5807,7 @@ class App(QWidget):
             pre = [(hx, 0.0 if tag == "bucket" else sizes[tag],
                     [[((x + 0.5) * sp, (y + 0.5) * sp) for x, y in p] for p in strokes]) for hx, tag, strokes in bg]
             bg_s = estimate_seconds(bg, qc) if bg else 0.0
+            log(f"quick plan: background {len(bg)} step(s), ~{bg_s:.0f}s, drawn while planning")
             pend = Pending()
             full_cfg = dict(cfg, _predrawn=pre) if pre else cfg
 
@@ -5503,17 +5815,19 @@ class App(QWidget):
                 boost_thread()
                 try:
                     # the rest can only start once planned: leave out the planning time too
-                    wait = max(0.0, (35.0 if tune else 12.0) - bg_s)
-                    c, plan, est, desc = plan_full(note, budget - bg_s - wait, full_cfg)
+                    wait = max(0.0, plan_s - bg_s)
+                    c, plan, est, desc = plan_full(note, budget - bg_s - wait, full_cfg, max(4.0, plan_s - 1))
                     pend.result = (c, plan, f"{desc}, ~{est:.0f}s")
                 except Exception as e:
+                    import traceback
+                    log(f"planning error: {e!r}\n{traceback.format_exc()}")
                     note["msg"] = f"planning failed ({e}): using the quick plan"
                     pend.result = (qc, qplan[len(bg):], "quick plan")
                 finally:
                     note["planned"] = True
                     pend.ready.set()
 
-            threading.Thread(target=work, daemon=True).start()
+            threading.Thread(target=work, daemon=True, name="plan-rest").start()
             state["plan"], state["pending"] = bg, pend
             note["msg"] = (f"drawing the background ({len(bg)} step{'s' * (len(bg) != 1)}, ~{bg_s:.0f}s) "
                            "while planning the rest" if bg else "planning while starting")
@@ -5521,7 +5835,7 @@ class App(QWidget):
 
         self.launch(lambda d: self.draw_and_correct(d, img, state["plan"], clicked + total / rate,
                                                     state.get("pending")), prepare,
-                    stages=self.draw_stages(self.cfg))
+                    stages=self.draw_stages(self.cfg), title="Start drawing")
 
     @staticmethod
     def draw_stages(cfg):
@@ -5631,17 +5945,22 @@ class App(QWidget):
         img, cfg = last
         cfg = dict(cfg, correct_passes=max(1, int(self.cfg.get("correct_passes", 0)) or 1))
         self.launch(lambda d: d.correct(target_for(img, d.cfg), cfg["correct_passes"]), lambda note: cfg,
-                    stages=("countdown", "correct"))
+                    stages=("countdown", "correct"), title="Correct now")
 
     def on_finished(self):
         self.drawing = False
         self.start_btn.setEnabled(True)
 
-    def launch(self, job, prepare=None, stages=("countdown",), planning=False):
+    def launch(self, job, prepare=None, stages=("countdown",), planning=False, title="Run"):
         """Run job(drawer) after a 5s countdown. prepare(note) runs alongside the countdown
         and returns the cfg to draw with. planning: a background plan is already running."""
         if self.drawing:
             return
+        log_reset(title)
+        c = self.cfg
+        log(f"settings: fine {c.get('brush_pt')}pt, colors {c.get('colors')}, line art {c.get('line_art')}, "
+            f"event delay {c.get('frame_ms')}ms (fastest {c.get('min_frame_ms')}ms), color wait "
+            f"{c.get('color_wait_ms')}ms, auto-tune {bool(c.get('autotune'))}, time limit {c.get('time_limit')}s")
         if self.cfg.get("focus_spot"):
             stages = tuple(st for st in stages if st != "countdown")
         self.progress_panel.begin(stages)
@@ -5649,7 +5968,11 @@ class App(QWidget):
         self.drawing = True
         self.stop_event.clear()
         self.start_btn.setEnabled(False)
-        emit = self.bridge.status.emit
+
+        def emit(msg):
+            if not msg.startswith(("Starting in", "Planning... ", "Step ")):
+                log(msg)
+            self.bridge.status.emit(msg)
 
         focus = self.cfg.get("focus_spot")
         wait_s = 0.0 if focus else 5.0
@@ -5669,11 +5992,15 @@ class App(QWidget):
                     threading.Thread(target=meter, daemon=True).start()
                 if prepare:  # plan during the countdown instead of before it
                     def run_prepare():
+                        t = time.time()
                         try:
                             result["cfg"] = prepare(note)
+                            log(f"prepare done in {time.time() - t:.1f}s: {note.get('msg', '')}")
                         except Exception as e:
+                            import traceback
+                            log(f"planning error: {e!r}\n{traceback.format_exc()}")
                             result["error"] = e
-                    th = threading.Thread(target=run_prepare, daemon=True)
+                    th = threading.Thread(target=run_prepare, daemon=True, name="plan")
                     th.start()
                 go_at, shown = time.time() + wait_s, None  # wall clock: background planning can't stretch it
                 while (left := go_at - time.time()) > 0:
@@ -5688,6 +6015,8 @@ class App(QWidget):
                     time.sleep(min(0.05, max(0.0, left)))
                 cfg = self.cfg
                 if prepare:
+                    if th.is_alive():
+                        log(f"countdown over, still planning: {note.get('msg', '')}")
                     while th.is_alive():  # planning outlasted the countdown
                         if stop_key_down():
                             raise Aborted("Esc pressed")
@@ -5712,13 +6041,16 @@ class App(QWidget):
                 emit(f"Aborted: {e}")
                 prog("end", 0, f"stopped ({e})", "")
             except Exception as e:
+                import traceback
                 _post(Quartz.kCGEventLeftMouseUp, *mouse_pos())
+                log(f"error: {e!r}\n{traceback.format_exc()}")
                 emit(f"Error: {e}")
                 prog("end", 0, "error", "")
             finally:
+                log("finished")
                 self.bridge.finished.emit()
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True, name="run").start()
 
 
 if __name__ == "__main__":
