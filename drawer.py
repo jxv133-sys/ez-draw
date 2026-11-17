@@ -3497,7 +3497,6 @@ def choose_sizes(img, cfg, curve, budget, emit=lambda m: None, prefetched=None):
     Returns (cfg_with_sizes, plan, est, sizes)."""
     curve = sorted(curve)
     d_min, d_max = curve_range(cfg, curve)
-    # every size, the finest included, is planned in parallel (the finest alone can take ~30s)
     # finest option is the smallest brush itself (the edge pass then switches off: it needs a
     # clearly finer pen); time decides whether that or a bigger fine brush + edges wins
     lo_d, hi_d = max(3.0, d_min), max(3.0, min(d_max, 30))
@@ -3506,30 +3505,38 @@ def choose_sizes(img, cfg, curve, budget, emit=lambda m: None, prefetched=None):
     if finest not in cands:
         cands = sorted(cands + [finest])
     import concurrent.futures as cf
+    # Drawing time does NOT reliably grow as the brush shrinks (sizes snap to slider/arrow
+    # steps, the big brush changes with the fine one), so every size is checked - but sizes
+    # that end up with the same real brushes give the same plan: plan one of each.
+    def brushes(f):
+        c = cfg_with_sizes(cfg, None, *sizes_for(f, d_min, d_max))
+        return json.dumps({k: c[k] for k in sorted(c) if "brush" in k or k == "spacing"}, default=str)
+    groups = {}
+    for f in cands:
+        groups.setdefault(brushes(f), []).append(f)
+    reps = sorted(min(g) for g in groups.values())  # the finest size of each group
     futs = dict(prefetched or {})
-    for f in sorted(cands, reverse=True):  # coarsest first: fastest to plan
+    emit(f"Planning {len(reps)} distinct brush sizes in parallel...")
+    end = PLAN_METER.expect(len(reps) + 1)
+    # the coarsest first (quick, and if even it's too slow nothing fits), then finest first:
+    # the finest take longest, so starting them early finishes the batch sooner
+    coarsest = reps[-1]
+    for f in [coarsest] + reps[:-1]:
         if f not in futs:
             futs[f] = search_submit(_estimate_job, img, cfg, sizes_for(f, d_min, d_max))
-    emit(f"Planning {len(cands)} brush sizes in parallel...")
-    end = PLAN_METER.expect(len(cands) + 1)
-    # time only grows as the brush shrinks: once a size is over budget, finer ones are skipped
-    results, too_slow = {}, 0.0
-    waiting = {futs[f]: f for f in cands}
+    results = {}
+    waiting = {futs[f]: f for f in reps}
     while waiting:
         done, _ = cf.wait(list(waiting), return_when=cf.FIRST_COMPLETED)
         for fut in done:
             f = waiting.pop(fut)
             results[f] = fut.result()
             PLAN_METER.tick()
-            if results[f][2] > budget:
-                too_slow = max(too_slow, f)
-        for fut, f in list(waiting.items()):
-            if f < too_slow:  # finer than a size that's already too slow
-                fut.cancel()
-                waiting.pop(fut)
-                PLAN_METER.tick()
-    for f in [g for g in futs if g not in cands or g < too_slow]:
-        futs[f].cancel()
+        if coarsest in results and results[coarsest][2] > budget:
+            break  # the fastest size is already too slow
+    for f, fut in futs.items():
+        if f not in results:
+            fut.cancel()
     fits = sorted(f for f, r in results.items() if r[2] <= budget)
     order = fits + sorted((f for f in results if f not in fits), reverse=True)
     for f in order[:3]:  # use the pick if its sizes match reality, else re-plan it exactly
