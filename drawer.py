@@ -3365,12 +3365,25 @@ def prep_configs(cfg):
 
 
 def _prep_job(path, cfg):
-    """Prepare one picture for one grid (worker process)."""
-    img = Image.open(path)
-    img.load()
-    a, kw = plan_args(img, cfg), plan_kw(cfg)
-    picture_prep(img, a[1], a[2], a[3], a[4], a[5], a[7], a[10], a[11], a[12],
-                 kw["line_art_r"] > 0, kw["line_contrast"])
+    """Prepare one picture for one grid (worker process). Single-threaded: it's background
+    work, and OpenCV / numpy's math library would otherwise use every core."""
+    import contextlib
+    try:
+        from threadpoolctl import threadpool_limits
+        limit = threadpool_limits(1)
+    except Exception:
+        limit = contextlib.nullcontext()
+    n = cv2.getNumThreads()
+    cv2.setNumThreads(1)
+    try:
+        with limit:
+            img = Image.open(path)
+            img.load()
+            a, kw = plan_args(img, cfg), plan_kw(cfg)
+            picture_prep(img, a[1], a[2], a[3], a[4], a[5], a[7], a[10], a[11], a[12],
+                         kw["line_art_r"] > 0, kw["line_contrast"])
+    finally:
+        cv2.setNumThreads(n)
 
 
 def _estimate_job(img, cfg, sizes):
@@ -4278,7 +4291,8 @@ class App(QWidget):
                           "your current brushes (higher is better); drop image files here to add them."))
         row = QHBoxLayout()
         for text, fn in [("Save pasted", self.lib_add_clipboard), ("Add files...", self.lib_add_files),
-                         ("Score all", self.lib_score_all), ("Pre-plan...", self.lib_preplan)]:
+                         ("Score all", self.lib_score_all), ("Prep", self.lib_prep_selected),
+                         ("Pre-plan...", self.lib_preplan)]:
             b = QPushButton(text)
             b.clicked.connect(fn)
             row.addWidget(b)
@@ -4313,7 +4327,6 @@ class App(QWidget):
         self.lib_planning = set()
         self.lib_scores, self.lib_scoring = self.lib_load_scores(), set()
         self.lib_refresh()
-        QTimer.singleShot(3000, self.lib_prep)  # prepare the library for planning, in the background
 
         # --- Calibrate tab: click each point in Roblox
         cal = QWidget()
@@ -4906,15 +4919,22 @@ class App(QWidget):
         if not self.lib_scoring:
             self.set_status_main("Library scored")
         self.lib_refresh()
-        self.lib_prep([p])
 
-    def lib_prep(self, paths=None):
+    def lib_prep_selected(self):
+        paths = [it.data(Qt.UserRole) for it in self.lib_list.selectedItems()]
+        paths = [p for p in paths if p and os.path.exists(p)]
+        if not paths:
+            self.set_status_main("Select one or more pictures to prep")
+            return
+        self.lib_prep(paths)
+
+    def lib_prep(self, paths):
         """In the background, do the brush-independent part of planning (scaling, colors, line
-        art) for library pictures on every grid the brush search may use, so planning at Start
+        art) for these pictures on every grid the brush search may use, so planning at Start
         skips it. Pauses while drawing; one picture/grid at a time to leave the CPU free."""
         if not hasattr(self, "_prep_todo"):
             self._prep_todo, self._prep_running = [], False
-        for p in (paths if paths is not None else self.lib_files()):
+        for p in paths:
             if p not in self._prep_todo:
                 self._prep_todo.append(p)
         if self._prep_running or not self._prep_todo:
@@ -4922,16 +4942,22 @@ class App(QWidget):
         try:
             self.read_settings()
             self.plan_checks()
-        except Exception:
-            return  # not calibrated yet: nothing to prepare for
+        except Exception as e:
+            self._prep_todo.clear()
+            self.set_status_main(f"Can't prep yet: {e}")
+            return
         cfg = dict(self.cfg)
         self._prep_running = True
 
         def work():
             try:
                 cfgs = prep_configs(cfg)
+                done = 0
                 while self._prep_todo:
                     p = self._prep_todo.pop(0)
+                    done += 1
+                    self.bridge.status.emit(f"Prepping {os.path.basename(p)} "
+                                            f"({done}/{done + len(self._prep_todo)})...")
                     for c in cfgs:
                         while self.drawing:
                             time.sleep(1.0)
@@ -4939,6 +4965,7 @@ class App(QWidget):
                             pool().submit(_prep_job, p, c).result()
                         except Exception:
                             break  # unreadable picture: skip it
+                self.bridge.status.emit(f"Prepped {done} picture(s): planning them at Start is faster")
             finally:
                 self._prep_running = False
         threading.Thread(target=work, daemon=True).start()
