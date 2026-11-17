@@ -1864,6 +1864,17 @@ class Drawer:
         _post(Quartz.kCGEventMouseMoved, x, y)
         self.last = (x, y)
 
+    def park(self):
+        """Move the cursor off the canvas (bottom-right corner) for a screenshot. Waits and
+        lifts the pen again first: a busy game can still have it down, and the move would
+        then draw a line across the canvas."""
+        if self.last is not None:
+            time.sleep(0.12)
+            _post(Quartz.kCGEventLeftMouseUp, *self.last)
+            time.sleep(0.08)
+        br = self.cfg["canvas_br"]
+        self.move(br[0] - 3, br[1] - 3)
+
     def click(self, x, y):
         self.move(x, y)
         self.ui_wait()
@@ -2421,7 +2432,7 @@ class Drawer:
             self.set_brush(pct)
             self.stroke([(cx, cy)])
         br = self.cfg["canvas_br"]
-        self.move(br[0] - 3, br[1] - 3)  # keep the cursor off the dots
+        self.park()  # keep the cursor off the dots
         time.sleep(0.3)
         x0 = int(min(c[0] - hf for _, c, hf in items))
         y0 = int(min(c[1] - hf for _, c, hf in items))
@@ -2670,7 +2681,7 @@ class Drawer:
         self._patch(bx_, by_, size + 2 * b, b)
         self.set_color("808080")
         self._patch(bx_ + b, by_ + b, size, b)
-        self.move(br[0] - 3, br[1] - 3)
+        self.park()
         time.sleep(0.4)
         x0, y0 = min(x for x, _ in spots), min(y for _, y in spots)
         x1, y1 = max(x for x, _ in spots) + size + 2 * b, max(y for _, y in spots) + size + 2 * b
@@ -2755,7 +2766,7 @@ class Drawer:
             self.set_color(hx)
             self.stroke([p])
         br = self.cfg["canvas_br"]
-        self.move(br[0] - 3, br[1] - 3)
+        self.park()
         time.sleep(0.35)
         cap = capture(ox, oy, 40 * len(seq) + 2 * b, 2 * b)
         if cap is None:
@@ -2786,7 +2797,7 @@ class Drawer:
 
         def ink_left():
             """Leftover ink mask and screenshot scale, or None if the screenshot failed."""
-            self.move(br[0] - 3, br[1] - 3)
+            self.park()
             time.sleep(0.35)
             cap = capture(x0, y0, x1 - x0, y1 - y0)
             return None if cap is None else ((cap[0].astype(np.int16).min(2) < 200).astype(np.uint8), cap[1])
@@ -2887,7 +2898,7 @@ class Drawer:
                 strokes = self._pattern(*pos, b, length)
                 for pts in strokes:
                     self.stroke(pts)
-                self.move(br[0] - 3, br[1] - 3)
+                self.park()
                 time.sleep(0.35)
                 res = self._check_pattern(strokes, *pos, w, h, b)
                 if res is None:
@@ -3302,6 +3313,32 @@ def _noop():
     return None
 
 
+_SEARCH_TAG = threading.local()  # set in a thread whose searches can be dropped (Preview)
+_TAGGED_FUTS = []
+
+
+def search_submit(fn, *args):
+    """pool().submit for planning searches; futures from a tagged thread are remembered so
+    cancel_searches() can drop them when that search is no longer wanted."""
+    f = pool().submit(fn, *args)
+    tag = getattr(_SEARCH_TAG, "tag", None)
+    if tag is not None:
+        _TAGGED_FUTS.append((tag, f))
+    return f
+
+
+def cancel_searches(tag):
+    """Cancel the queued (not yet running) jobs of searches started under `tag`, so a newer
+    search doesn't wait behind ones nobody needs any more."""
+    keep = []
+    for t, f in _TAGGED_FUTS:
+        if t == tag:
+            f.cancel()
+        elif not f.done():
+            keep.append((t, f))
+    _TAGGED_FUTS[:] = keep
+
+
 def sizes_for(fine, d_min, d_max):
     """Brush set for a fine size: big ~5x fine (if the slider goes that big), tiny = smallest."""
     big = min(d_max * 0.9, 5 * fine)
@@ -3392,7 +3429,7 @@ def search_guess(cfg, tune):
 def prefetch_estimates(img, cfg, d_min, d_max):
     """Start planning every candidate fine size in the background (guessed tiny/big sizes),
     coarsest (fastest) first. Returns {fine: future -> (sizes, plan, est)}."""
-    return {f: pool().submit(_estimate_job, img, cfg, sizes_for(f, d_min, d_max))
+    return {f: search_submit(_estimate_job, img, cfg, sizes_for(f, d_min, d_max))
             for f in sorted(FINE_CANDIDATES, reverse=True)}
 
 
@@ -3425,7 +3462,7 @@ def upgrade_detail(img, cfg, plan, est, budget, emit=lambda m: None, futs=None):
         return cfg, plan, est, None
     levels = detail_levels(cfg)
     emit(f"Plan needs ~{est:.0f}s of {budget:.0f}s: trying {len(levels)} more detailed versions...")
-    futs = futs or [(desc, dict(cfg, **chg), pool().submit(_plan_job, img, dict(cfg, **chg))) for desc, chg in levels]
+    futs = futs or [(desc, dict(cfg, **chg), search_submit(_plan_job, img, dict(cfg, **chg))) for desc, chg in levels]
     end = PLAN_METER.expect(len(futs))
     try:
         for n, (desc, c, f) in enumerate(reversed(futs)):  # most detailed first: stop at the first that fits
@@ -3459,7 +3496,7 @@ def choose_sizes(img, cfg, curve, budget, emit=lambda m: None, prefetched=None):
     futs = dict(prefetched or {})
     for f in sorted(cands, reverse=True):  # coarsest first: fastest to plan
         if f not in futs:
-            futs[f] = pool().submit(_estimate_job, img, cfg, sizes_for(f, d_min, d_max))
+            futs[f] = search_submit(_estimate_job, img, cfg, sizes_for(f, d_min, d_max))
     emit(f"Planning {len(cands)} brush sizes in parallel...")
     end = PLAN_METER.expect(len(cands) + 1)
     # time only grows as the brush shrinks: once a size is over budget, finer ones are skipped
@@ -3586,7 +3623,7 @@ def auto_settings(img, cfg, budget, emit=lambda m: None):
     for key, values in AUTO_SETTINGS:
         if key == "edge_contrast" and not tiny_on:
             continue  # no edge pass with these brushes
-        tries = [(v, pool().submit(_quality_job, img, dict(c, **{key: v}))) for v in values if v != c.get(key)]
+        tries = [(v, search_submit(_quality_job, img, dict(c, **{key: v}))) for v in values if v != c.get(key)]
         best = (err, est, c.get(key))
         for v, f in tries:
             e2, t2 = f.result()
@@ -3612,7 +3649,7 @@ def auto_tune(img, cfg, budget, emit=lambda m: None):
     combos = [dict(c, colors=n, smooth=sm, line_art=la)
               for n in (12, 20, 28) for sm in (0.5, 1.0, 1.5) for la in (True, False)]
     emit(f"Auto-tune: trying {len(combos)} setting combinations...")
-    futs = [(cc, pool().submit(_quality_job, img, cc)) for cc in combos]
+    futs = [(cc, search_submit(_quality_job, img, cc)) for cc in combos]
     end = PLAN_METER.expect(len(futs) + 1)
     scored = []
     for cc, f in futs:
@@ -5005,7 +5042,10 @@ class App(QWidget):
             self._pv_msg = msg
             self._pv_timer.start(300)
 
+        cancel_searches("preview")  # an older preview's queued plans would delay this one
+
         def work():
+            _SEARCH_TAG.tag = "preview"
             try:
                 note = ""
                 if repick:  # show what Start will draw: sizes re-picked for this picture
@@ -5025,7 +5065,8 @@ class App(QWidget):
     def _preview_tick(self):
         if self._pv_done == self._preview_gen:
             return self._pv_timer.stop()
-        if not self.drawing:
+        # only while the label still shows this meter: never write over another message
+        if not self.drawing and self.status_label.text().startswith(self._pv_msg):
             self.set_status_main(f"{self._pv_msg} {PLAN_METER.text()}")
 
     def show_preview(self, gen, res):
@@ -5221,6 +5262,10 @@ class App(QWidget):
         except Exception as e:
             self.error(str(e))
             return
+
+        cancel_searches("preview")  # a busy CPU slows the game and makes the timing look worse
+        self._pv_done = self._preview_gen
+        self._pv_timer.stop()
 
         def job(d):
             res, log = d.auto_speed()
