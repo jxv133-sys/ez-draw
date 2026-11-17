@@ -2218,12 +2218,13 @@ class Drawer:
             last_check[0] = elapsed
             old = next(((e, p) for e, p in pace if elapsed - e <= 8), pace[0])
             recent = (elapsed - old[0]) / max(0.1, pred_now - old[1]) if pred_now - old[1] > 0.3 else 0
-            speed = max(1.0, elapsed / pred_now, recent)
+            overall = elapsed / pred_now
+            speed = max(1.0, overall, (overall + recent) / 2)  # a slow last few seconds counts, damped
             left = self.deadline - time.time() - 1.5
             future = list(range(ci, len(seq)))  # steps after the current one
             cur_left = max(0.0, sum(costs[:ci]) - base["p"] - pred_now)  # rest of the current step
             need = (cur_left + sum(costs[i] for i in future)) * speed
-            if need <= left or not future:
+            if need <= left * 1.1 or not future or elapsed < 15:  # small/early misses are noise
                 return
             value = {i: step_value(seq[i], self.cfg) / max(1e-3, costs[i]) for i in future}
             drop = set()
@@ -2238,6 +2239,8 @@ class Drawer:
             del cache[ci:]
             parts = []
             note = f" | late: skipped {len(drop)} small details to finish"
+            log(f"late check: {elapsed:.0f}s drawn vs {pred_now:.0f}s predicted (overall x{overall:.2f}, "
+                f"last 8s x{recent:.2f}); need {need:.0f}s, {left:.0f}s left: dropping {len(drop)} steps")
             self.status(f"Running {speed:.1f}x slower than planned: skipping {len(drop)} "
                         "low-value detail steps to finish in time")
         while True:
@@ -2403,11 +2406,18 @@ class Drawer:
             per_stroke = step_s / max(1, len(strokes))
             step_pred0 = sum(costs[:ci - 1]) if costs else 0.0
             step_cost_now = costs[ci - 1] if costs and ci - 1 < len(costs) else 0.0
+            # progress inside a step by stroke length, not count: long strokes first made a
+            # step look slow and threw away detail that would have fit
+            seg_len = max(1.0, float(self.cfg["segment"]) / max(1e-6, s))
+            wts = [2.0 + sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(p, p[1:])) / seg_len + len(p)
+                   for p in strokes]
+            wcum, wtot = 0.0, max(1e-6, sum(wts))
             for si, pts in enumerate(strokes, 1):
                 self.stroke([(cx0 + (gx + 0.5) * s, cy0 + (gy + 0.5) * s) for gx, gy in pts])
                 done += 1
                 if costs and seq is not None:
-                    late_check(step_pred0 + step_cost_now * si / len(strokes))
+                    wcum += wts[si - 1]
+                    late_check(step_pred0 + step_cost_now * wcum / wtot)
                 done_s[stage] = done_s.get(stage, 0.0) + per_stroke
                 if si % 3 == 0 or si == len(strokes):
                     self._report(stage, done_s[stage], totals, f"{label} {si}/{len(strokes)}", hexstr)
@@ -3401,7 +3411,7 @@ def cfg_with_sizes(cfg, curve, fine, big, tiny):
     hit = arrow_clicks_for(c, fine)
     c["brush_clicks"] = hit[0] if hit else None
     fine = hit[1] if hit else fine
-    c["brush_pt"], c["spacing"] = fine, round(fine * 0.9, 1)
+    c["brush_pt"], c["spacing"] = fine, fill_spacing(fine, c)
     c["brush_pct"] = round(pct(fine), 1)
     for key, d in (("big", big), ("tiny", tiny)):
         hit = arrow_clicks_for(c, d) if d else None
@@ -3410,6 +3420,17 @@ def cfg_with_sizes(cfg, curve, fine, big, tiny):
         c[f"{key}_brush_pt"] = d or None
         c[f"{key}_brush_pct"] = max(0.5, round(pct(d), 1)) if d else 0
     return c
+
+
+LINE_SHRINK_PT = 0.7  # a drawn line is ~0.7pt narrower than the dot Auto brush measures
+
+
+def fill_spacing(fine, cfg=None):
+    """Row spacing for a fine brush of `fine` pt (as measured from a dot): rows must overlap
+    the real line width, or thin white lines show between them (seen at 1px per point:
+    3pt dots drew ~2.3pt lines, leaving a gap every third row at 2.7pt spacing)."""
+    shrink = float((cfg or {}).get("line_shrink_pt", LINE_SHRINK_PT))
+    return round(0.9 * max(0.6 * fine, fine - shrink), 1)
 
 
 FINE_CANDIDATES = sorted({round(float(d), 1) for d in np.geomspace(3, 30, 20)})
@@ -3590,12 +3611,12 @@ PLAN_METER = PlanMeter()
 
 
 QUALITY = {  # speed vs detail: smallest fine brush the search may pick, colors, planning time
-    "fast": {"edges": False, "min_fine": 6.0, "max_colors": 16, "detail": False, "plan_share": 0.15, "tune_colors": (8, 12, 16),
+    "fast": {"edges": False, "min_fine": 6.0, "max_colors": 16, "detail": False, "plan_share": 0.1, "tune_colors": (8, 12, 16),
              "label": "Fast", "tip": "Fine brush 6pt or bigger, up to 16 colors, no edge pass or line art: "
                                      "plans in seconds, draws quickly"},
-    "balanced": {"edges": True, "min_fine": 4.3, "max_colors": 24, "detail": True, "plan_share": 0.25, "tune_colors": (12, 18, 24),
+    "balanced": {"edges": True, "min_fine": 4.3, "max_colors": 24, "detail": True, "plan_share": 0.15, "tune_colors": (12, 18, 24),
                  "label": "Balanced", "tip": "Fine brush 4.3pt or bigger, up to 24 colors"},
-    "best": {"edges": True, "min_fine": 3.0, "max_colors": 32, "detail": True, "plan_share": 0.3, "tune_colors": (12, 20, 28),
+    "best": {"edges": True, "min_fine": 3.0, "max_colors": 32, "detail": True, "plan_share": 0.2, "tune_colors": (12, 20, 28),
              "label": "Best", "tip": "Smallest brushes and most colors: slow to plan and draw"},
 }
 
@@ -3975,9 +3996,14 @@ PLAN_FREE_KEYS = {"time_limit", "time_factor", "timing_model", "game_rate", "cor
 PLANS_PER_PICTURE = 6  # plans for other settings are kept (switching a setting back reuses them)
 
 
+PLAN_VERSION = 2  # bump when planning changes in a way that makes stored plans worse (2: row spacing)
+
+
 def plan_settings(cfg):
     """The settings a plan depends on (brushes, colors, canvas, image settings)."""
-    return {k: cfg[k] for k in sorted(cfg) if k not in PLAN_FREE_KEYS and not k.startswith("_")}
+    keep = {k: cfg[k] for k in sorted(cfg) if k not in PLAN_FREE_KEYS and not k.startswith("_")}
+    keep["plan_version"] = PLAN_VERSION
+    return keep
 
 
 def plan_settings_key(cfg):
@@ -5715,7 +5741,7 @@ class App(QWidget):
     def set_brush_size(self, key, diam):
         self.cfg[key] = round(diam, 1)
         if key == "brush_pt":
-            self.edits["spacing"][0].setText(str(round(diam * 0.9, 1)))  # overlap: no gaps
+            self.edits["spacing"][0].setText(str(fill_spacing(diam, self.cfg)))  # overlap: no gaps
         self.read_settings()
 
     def next_hover(self):
